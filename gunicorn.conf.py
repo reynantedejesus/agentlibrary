@@ -22,6 +22,20 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
+
+# Gunicorn executes THIS FILE before it imports wsgi.py, so create_app() has
+# not run yet and nothing has read /etc/agentlibrary/agentlibrary.env. Without
+# this, every GUNICORN_* setting below would silently fall back to its default
+# even though the environment file defines it. Load the same file here, using
+# the same loader the application uses, so both agree.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from app import load_environment_files
+
+    load_environment_files()
+except ImportError:  # the app package is not importable yet — defaults apply
+    pass
 
 
 def _int(name, default):
@@ -42,6 +56,28 @@ if not bind.startswith("unix:") and _host not in ("127.0.0.1", "localhost", "::1
         "Refusing to bind gunicorn to %r. Bind to a Unix socket or 127.0.0.1 "
         "and let nginx terminate TLS in front of it." % bind
     )
+
+if bind.startswith("unix:"):
+    _socket_path = bind[len("unix:"):]
+    _socket_dir = os.path.dirname(_socket_path) or "."
+    if not os.path.isdir(_socket_dir):
+        raise RuntimeError(
+            "Gunicorn is set to bind {0}, but {1} does not exist.\n"
+            "  systemd creates it automatically (RuntimeDirectory= in "
+            "agentlibrary.service), so `systemctl start agentlibrary` needs "
+            "nothing extra.\n"
+            "  To run gunicorn by hand, either create the directory:\n"
+            "      sudo mkdir -p {1} && sudo chown agentlibrary:agentlibrary {1}\n"
+            "  or bind a loopback port instead:\n"
+            "      GUNICORN_BIND=127.0.0.1:8000 gunicorn -c gunicorn.conf.py "
+            "wsgi:application".format(bind, _socket_dir)
+        )
+    if not os.access(_socket_dir, os.W_OK):
+        raise RuntimeError(
+            "Gunicorn cannot write the socket into {0} as uid {1}. Run as the "
+            "service account: sudo -u agentlibrary .venv/bin/gunicorn -c "
+            "gunicorn.conf.py wsgi:application".format(_socket_dir, os.getuid())
+        )
 
 # Socket permissions: nginx must be able to connect. 0o660 with the socket
 # owned by the agentlibrary user and group, plus nginx added to that group,

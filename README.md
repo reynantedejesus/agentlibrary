@@ -266,6 +266,42 @@ LOG_DIR=/var/log/agentlibrary
 
 The app **refuses to start** in production without a real `SECRET_KEY`.
 
+### How this file gets loaded
+
+| How you start it | What reads the file |
+| --- | --- |
+| `systemctl start agentlibrary` | systemd, via `EnvironmentFile=` in the unit |
+| `gunicorn -c gunicorn.conf.py wsgi:application` | the app itself |
+| `flask db upgrade`, `flask create-admin`, … | the app itself |
+
+Both `gunicorn.conf.py` and `create_app()` read
+`/etc/agentlibrary/agentlibrary.env` automatically, so a command run by hand
+behaves the same as the service. Nothing already present in the environment is
+overwritten, so systemd and deliberate `export`s still win.
+
+To point at a different file — a staging copy, or a path of your own — set
+`ENV_FILE`:
+
+```bash
+ENV_FILE=/etc/agentlibrary/staging.env .venv/bin/gunicorn -c gunicorn.conf.py wsgi:application
+```
+
+`ENV_FILE` is strict: if the path does not exist, startup fails saying so,
+rather than falling through to a confusing `SECRET_KEY is not set`.
+
+> The file is mode `0640` owned `root:agentlibrary`, so **your own account
+> probably cannot read it**. Run these commands as the service account
+> (`sudo -u agentlibrary ...`), or add yourself to the group with
+> `sudo usermod -a -G agentlibrary $USER` and log out and back in. If the file
+> cannot be read, the startup error says exactly that.
+
+Values containing spaces or `#` should be quoted, so that systemd and the
+application's parser agree:
+
+```ini
+MYSQL_PASSWORD="p@ss word#1"
+```
+
 ---
 
 ## 5. Database setup
@@ -673,8 +709,7 @@ Before wiring systemd, prove gunicorn serves the app.
 
 ```bash
 cd /opt/agentlibrary
-sudo -u agentlibrary env $(grep -v '^#' /etc/agentlibrary/agentlibrary.env | xargs) \
-     GUNICORN_BIND=127.0.0.1:8000 \
+sudo -u agentlibrary GUNICORN_BIND=127.0.0.1:8000 \
      .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
 ```
 
@@ -694,8 +729,7 @@ sudo mkdir -p /run/agentlibrary
 sudo chown agentlibrary:agentlibrary /run/agentlibrary
 sudo chmod 750 /run/agentlibrary
 
-sudo -u agentlibrary env $(grep -v '^#' /etc/agentlibrary/agentlibrary.env | xargs) \
-     .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
+sudo -u agentlibrary .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
 ```
 
 ```bash
@@ -1056,14 +1090,60 @@ group (`groups nginx`); the socket has the wrong SELinux label; or
 
 ```bash
 journalctl -u agentlibrary -n 50 --no-pager
-sudo -u agentlibrary env $(grep -v '^#' /etc/agentlibrary/agentlibrary.env | xargs) \
-     /opt/agentlibrary/.venv/bin/python -c "import app; app.create_app(); print('factory OK')"
+sudo -u agentlibrary /opt/agentlibrary/.venv/bin/python -c \
+     "import app; app.create_app(); print('factory OK')"
 sudo -u agentlibrary test -r /etc/agentlibrary/agentlibrary.env && echo readable
 systemd-analyze verify /etc/systemd/system/agentlibrary.service
 ```
 
-`RuntimeError: SECRET_KEY is not set` means the environment file is missing,
-unreadable by the service account, or has no `SECRET_KEY`.
+### `RuntimeError: SECRET_KEY is not set`
+
+The error names the cause. The three cases are:
+
+| Message says | Meaning | Fix |
+| --- | --- | --- |
+| *No environment file was found at …* | The path does not exist | Create it, or pass `ENV_FILE=/path/to/file` |
+| *… is not readable by uid N* | The file is `0640 root:agentlibrary` and you are not that user | `sudo -u agentlibrary …`, or join the `agentlibrary` group |
+| *… was read, but it does not define SECRET_KEY* | The file loaded but the key is absent | Add a generated key to it |
+
+```bash
+# Which file is it looking at, and can you read it?
+sudo -u agentlibrary test -r /etc/agentlibrary/agentlibrary.env && echo readable
+sudo grep -c SECRET_KEY /etc/agentlibrary/agentlibrary.env
+
+# Generate and append one
+python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(64))" \
+    | sudo tee -a /etc/agentlibrary/agentlibrary.env
+sudo systemctl restart agentlibrary
+```
+
+Note that `systemctl start agentlibrary` loads the file through
+`EnvironmentFile=`; running `gunicorn` from your own shell relies on the
+application loading it, which needs the file to be readable *by you*.
+
+### Gunicorn settings from the env file appear to be ignored
+
+`gunicorn.conf.py` is executed before `wsgi.py` is imported, so it loads the
+environment file itself. If `GUNICORN_WORKERS` or `GUNICORN_BIND` still look
+wrong, check what it actually resolved:
+
+```bash
+sudo -u agentlibrary .venv/bin/gunicorn -c gunicorn.conf.py --print-config wsgi:application | head
+journalctl -u agentlibrary | grep "Agent Library starting"
+```
+
+### `connection to /run/agentlibrary/agentlibrary.sock failed`
+
+Running gunicorn by hand without the directory systemd normally creates.
+Either use the service (`sudo systemctl start agentlibrary`), create the
+directory, or bind a loopback port for the test:
+
+```bash
+sudo mkdir -p /run/agentlibrary
+sudo chown agentlibrary:agentlibrary /run/agentlibrary
+# or
+GUNICORN_BIND=127.0.0.1:8000 .venv/bin/gunicorn -c gunicorn.conf.py wsgi:application
+```
 
 ### Database connection errors
 
