@@ -1,0 +1,19 @@
+# /etc/logrotate.d/agentlibrary
+#
+# The application also logs to the journal (journalctl -u agentlibrary), which
+# systemd rotates on its own. This handles the rotating file sink in
+# $LOG_DIR, which is useful when you want the app log separate from the unit
+# journal. Verify with:  sudo logrotate -d /etc/logrotate.d/agentlibrary
+
+/var/log/agentlibrary/*.log {
+    daily
+    rotate 30
+    size 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su agentlibrary agentlibrary
+    create 0640 agentlibrary agentlibrary
+}

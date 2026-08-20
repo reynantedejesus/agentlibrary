@@ -1,0 +1,23 @@
+# /etc/systemd/system/agentlibrary.socket   (OPTIONAL)
+#
+# Socket activation. Use this only if you want systemd to own the socket's
+# lifecycle and permissions rather than gunicorn. If you enable it, set
+# GUNICORN_BIND=fd://3 in the environment file and enable the socket instead of
+# the service:
+#
+#   sudo systemctl enable --now agentlibrary.socket
+#
+# The default deployment does NOT need this — gunicorn creates the socket in
+# the RuntimeDirectory itself.
+
+[Unit]
+Description=Agent Library gunicorn socket
+
+[Socket]
+ListenStream=/run/agentlibrary/agentlibrary.sock
+SocketUser=agentlibrary
+SocketGroup=agentlibrary
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

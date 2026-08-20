@@ -1,0 +1,39 @@
+## agentlibrary.te — optional SELinux policy module
+##
+## In most deployments you do NOT need this file. Setting the right file
+## contexts and the httpd_can_network_connect boolean (see README §7) is
+## enough, because the app runs as an ordinary unconfined systemd service and
+## only nginx is confined.
+##
+## Build and install ONLY if `ausearch` shows denials that contexts cannot fix:
+##
+##   sudo dnf install -y policycoreutils-devel selinux-policy-devel
+##   cd deploy/selinux
+##   make -f /usr/share/selinux/devel/Makefile agentlibrary.pp
+##   sudo semodule -i agentlibrary.pp
+##   sudo semodule -l | grep agentlibrary
+##
+## Remove with:
+##   sudo semodule -r agentlibrary
+##
+## Prefer generating a module from real denials instead of guessing:
+##   sudo ausearch -m AVC -ts recent | audit2allow -M agentlibrary_local
+##   sudo semodule -i agentlibrary_local.pp
+## and read the generated .te before installing it — audit2allow will happily
+## grant more than you want.
+
+module agentlibrary 1.0;
+
+require {
+    type httpd_t;
+    type var_run_t;
+    type var_lib_t;
+    class sock_file { write getattr };
+    class unix_stream_socket connectto;
+}
+
+## Allow nginx (httpd_t) to connect to the gunicorn Unix socket in
+## /run/agentlibrary. This is the one rule most deployments end up needing if
+## the socket is not labelled httpd_var_run_t.
+allow httpd_t var_run_t:sock_file { write getattr };
+allow httpd_t self:unix_stream_socket connectto;

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Agent Library &middot; Wings&reg; Global Travel</title>
+
+{# The CSRF token is rendered into a meta tag so app.js can send it on every
+   state-changing request. It is also mirrored into a readable `csrf_token`
+   cookie by the after_request hook, which is what the SPA re-reads after the
+   session rotates on login. The SESSION cookie itself stays HttpOnly. #}
+<meta name="csrf-token" content="{{ csrf_token }}">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Montserrat:wght@400;500;600;700&family=Caveat:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="icon" href="{{ url_for('static', filename='images/wings-logo.png') }}" type="image/png">
+</head>
+<body>
+
+{# Progressive enhancement: without JavaScript the shell still identifies
+   itself and tells the reader what to do, instead of rendering a blank page. #}
+<noscript>
+  <div class="noscript-banner">
+    <strong>The Agent Library needs JavaScript.</strong>
+    This registry loads its catalogue from the server after the page opens.
+    Enable JavaScript, or contact the Tech team for an export of the catalogue.
+  </div>
+</noscript>
+
+<div id="app-shell">
+  <!-- ============================ SIDEBAR ============================ -->
+  <nav id="sidebar" aria-label="Primary">
+    <div class="brand">
+      <img class="brand-logo-img" alt="Wings Global Travel"
+           src="{{ url_for('static', filename='images/wings-logo.png') }}"
+           width="440" height="130">
+      <div class="brand-product-name">Agent Library</div>
+    </div>
+    <ul id="nav-list"></ul>
+    <div id="sidebar-account"></div>
+    <div id="build-marker">v{{ app_version }}</div>
+  </nav>
+
+  <!-- ============================ MAIN COLUMN ============================ -->
+  <div id="main-col">
+    <header id="topbar">
+      <button class="icon-btn" id="mobile-nav-toggle" aria-label="Toggle navigation"
+              aria-expanded="false" aria-controls="sidebar" style="display:none;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <div>
+        <div class="topbar-title" id="topbar-title">Library</div>
+        <div class="topbar-crumb" id="topbar-crumb">Agent Library</div>
+      </div>
+      <div class="spacer"></div>
+      <div id="topbar-actions"></div>
+      <button class="btn btn-primary" id="topbar-add-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+        Add to Library
+      </button>
+    </header>
+
+    <!-- Announces view changes and async results to assistive technology. -->
+    <p class="sr-only" id="live-region" role="status" aria-live="polite"></p>
+
+    <main id="view-root" tabindex="-1"></main>
+  </div>
+</div>
+
+<!-- Detail slide-over -->
+<div id="detail-overlay" role="presentation">
+  <section id="detail-panel" role="dialog" aria-modal="true"
+           aria-label="Asset details" tabindex="-1"></section>
+</div>
+
+<!-- Generic modal (confirmations, add version, sign in, change password) -->
+<div id="modal-overlay" role="presentation">
+  <div class="modal-box" id="modal-box" role="dialog" aria-modal="true"
+       aria-labelledby="modal-title" tabindex="-1"></div>
+</div>
+
+<div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+{# Bootstrap data as JSON, parsed by app.js. Using a JSON script block rather
+   than inline JavaScript keeps the strict Content-Security-Policy intact
+   (no 'unsafe-inline' for scripts) and makes injection impossible: the
+   browser never executes this, it only parses it. #}
+<script type="application/json" id="bootstrap-data">
+{{ {"user": bootstrap_user, "version": app_version} | tojson }}
+</script>
+
+<script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</body>
+</html>
