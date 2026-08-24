@@ -24,7 +24,6 @@ from __future__ import annotations
 import datetime as _dt
 from typing import Any, Dict, List, Optional
 
-from flask_login import UserMixin
 from sqlalchemy import Index, UniqueConstraint
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -59,7 +58,15 @@ def _iso_dt(value) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # users
 # ---------------------------------------------------------------------------
-class User(UserMixin, db.Model):
+class User(db.Model):
+    """The administrator account backing the shared console password.
+
+    Exactly one row in normal operation, created by ``flask create-admin``.
+    The ``role`` column is retained so per-person accounts can be reintroduced
+    without a migration, but nothing in the application reads it beyond
+    locating the admin row.
+    """
+
     __tablename__ = "users"
 
     id = db.Column(db.BigInteger().with_variant(db.Integer, "sqlite"), primary_key=True)
@@ -91,15 +98,9 @@ class User(UserMixin, db.Model):
             return False
         return check_password_hash(self.password_hash, raw)
 
-    # -- flask-login -------------------------------------------------------
     @property
-    def is_active(self) -> bool:          # type: ignore[override]
+    def is_active(self) -> bool:
         return bool(self.is_active_flag)
-
-    def get_id(self) -> str:
-        # The password-hash fragment invalidates every existing session when
-        # the password changes (flask-login "strong" session protection).
-        return "{0}|{1}".format(self.id, (self.password_hash or "")[-16:])
 
     # -- roles -------------------------------------------------------------
     @property
@@ -266,13 +267,28 @@ class Asset(db.Model):
     )
     files = db.relationship(
         "AssetFile", back_populates="asset",
+        foreign_keys="AssetFile.asset_id",
         cascade="all, delete-orphan", order_by="AssetFile.created_at.asc()",
     )
     asset_tags = db.relationship(
         "AssetTag", back_populates="asset", cascade="all, delete-orphan",
     )
+    update_requests = db.relationship(
+        "UpdateRequest", back_populates="asset", cascade="all, delete-orphan",
+        order_by="UpdateRequest.created_at.desc()",
+    )
 
     # -- helpers -----------------------------------------------------------
+    @property
+    def knowledge_files(self) -> List["AssetFile"]:
+        """Files shown under "Knowledge Base" on the Configuration tab."""
+        return [f for f in self.files if f.kind == "knowledge"]
+
+    @property
+    def context_files(self) -> List["AssetFile"]:
+        """Files shown under "Context" (Claude Skill / Project only)."""
+        return [f for f in self.files if f.kind == "context"]
+
     @property
     def tag_names(self) -> List[str]:
         return [at.tag.name for at in self.asset_tags if at.tag is not None]
@@ -379,28 +395,22 @@ class Asset(db.Model):
                 "rejectionReason": self.rejection_reason or "",
                 "additionalDepartments": self.additional_departments or [],
                 "configuration": self.configuration or {},
+                # Rendered by the Configuration tab; real uploads rather than
+                # the prototype's filename-only placeholders.
+                "knowledgeFiles": [f.to_dict() for f in self.knowledge_files],
+                "contextFiles": [f.to_dict() for f in self.context_files],
                 "versions": [v.to_dict() for v in sorted(
                     self.versions, key=lambda v: (v.created_at or utcnow()), reverse=True)],
                 "files": [f.to_dict() for f in self.files],
                 "ownerUserId": self.owner_id,
                 "creatorUserId": self.creator_id,
             })
-            data["canEdit"] = self.viewer_can_edit(viewer)
-            data["canReview"] = bool(viewer and viewer.is_authenticated
-                                     and viewer.has_role(reference.ROLE_REVIEWER))
+            # Rendering hints only — every endpoint re-checks the session.
+            from app.security import is_admin
+            unlocked = is_admin()
+            data["canEdit"] = unlocked
+            data["canReview"] = unlocked
         return data
-
-    def viewer_can_edit(self, viewer: Optional[User]) -> bool:
-        """IDOR guard used by both the API and the serialiser."""
-        if viewer is None or not getattr(viewer, "is_authenticated", False):
-            return False
-        if viewer.has_role(reference.ROLE_REVIEWER):
-            return True
-        if self.creator_id and self.creator_id == viewer.id:
-            return self.status in (reference.STATUS_PENDING, reference.STATUS_REJECTED)
-        if self.owner_id and self.owner_id == viewer.id:
-            return self.status in (reference.STATUS_PENDING, reference.STATUS_REJECTED)
-        return False
 
     def __repr__(self) -> str:
         return "<Asset {0} {1}>".format(self.wgt_code, self.name)
@@ -457,9 +467,19 @@ class AssetFile(db.Model):
     __tablename__ = "asset_files"
 
     id = db.Column(db.BigInteger().with_variant(db.Integer, "sqlite"), primary_key=True)
+    # Nullable because a file can exist before anything owns it. The public
+    # Add-to-Library and Update-an-Agent forms let people attach files before
+    # the record they belong to has been created, so uploads land "staged"
+    # (asset_id and update_request_id both NULL) and are claimed on submit.
+    # Unclaimed rows are swept up by `flask prune-uploads`.
     asset_id = db.Column(
         db.BigInteger().with_variant(db.Integer, "sqlite"),
-        db.ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True,
+        db.ForeignKey("assets.id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    update_request_id = db.Column(
+        db.BigInteger().with_variant(db.Integer, "sqlite"),
+        db.ForeignKey("update_requests.id", ondelete="CASCADE"),
+        nullable=True, index=True,
     )
     asset_version_id = db.Column(
         db.BigInteger().with_variant(db.Integer, "sqlite"),
@@ -484,8 +504,14 @@ class AssetFile(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
 
     asset = db.relationship("Asset", back_populates="files")
+    update_request = db.relationship("UpdateRequest", back_populates="files")
     version = db.relationship("AssetVersion")
     uploaded_by = db.relationship("User")
+
+    @property
+    def is_staged(self) -> bool:
+        """Uploaded but not yet claimed by an asset or an update request."""
+        return self.asset_id is None and self.update_request_id is None
 
     @property
     def human_size(self) -> str:
@@ -597,3 +623,118 @@ class ConfigSetting(db.Model):
 
     def __repr__(self) -> str:
         return "<ConfigSetting {0}>".format(self.key)
+
+
+# ---------------------------------------------------------------------------
+# update_requests
+# ---------------------------------------------------------------------------
+class UpdateRequest(db.Model):
+    """A proposed change to an already-published asset.
+
+    Anyone browsing the Library can raise one; it never touches the asset.
+    An administrator reviews the proposed values and either accepts them
+    (applied in one transaction, with a version entry appended) or declines.
+
+    ``fields`` lists which field ids the requester ticked; ``proposed`` holds
+    the new text values for them. Proposed *files* are not in the JSON — they
+    are real ``AssetFile`` rows pointing at this request, so they go through
+    the same validation, scanning and private storage as any other upload.
+    """
+    __tablename__ = "update_requests"
+    __table_args__ = (
+        Index("ix_update_requests_status_created", "status", "created_at"),
+    )
+
+    id = db.Column(db.BigInteger().with_variant(db.Integer, "sqlite"), primary_key=True)
+    asset_id = db.Column(
+        db.BigInteger().with_variant(db.Integer, "sqlite"),
+        db.ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    # Snapshots, so the admin queue still reads correctly if the asset is
+    # renamed or archived between submission and review.
+    wgt_code = db.Column(db.String(16), nullable=False, index=True)
+    asset_name = db.Column(db.String(200), nullable=False, default="")
+
+    fields = db.Column(db.JSON, nullable=False, default=list)
+    proposed = db.Column(db.JSON, nullable=False, default=dict)
+    notes = db.Column(db.Text, nullable=True)
+
+    # Free text: there are no user accounts, so this is what the requester
+    # typed. The admin view warns when it does not match the owner on record.
+    requester_name = db.Column(db.String(160), nullable=False, default="")
+    requester_email = db.Column(db.String(254), nullable=False, default="")
+
+    status = db.Column(db.String(16), nullable=False,
+                       default=reference.UPDATE_STATUS_OPEN, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+    resolution_note = db.Column(db.Text, nullable=True)
+    submitted_ip = db.Column(db.String(45), nullable=True)
+
+    asset = db.relationship("Asset", back_populates="update_requests")
+    files = db.relationship(
+        "AssetFile", back_populates="update_request",
+        foreign_keys="AssetFile.update_request_id",
+        cascade="all, delete-orphan",
+    )
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == reference.UPDATE_STATUS_OPEN
+
+    def files_for(self, files_key: str) -> List["AssetFile"]:
+        """Proposed files for one field ("knowledgeFiles" / "contextFiles")."""
+        return [f for f in self.files if f.kind == _FILES_KEY_TO_KIND.get(files_key, files_key)]
+
+    def owner_mismatch(self) -> bool:
+        """Whether the requester differs from the asset's owner on record.
+
+        Not an error — a colleague may legitimately flag a change on the
+        owner's behalf — but worth surfacing before an admin accepts edits to
+        someone else's tool.
+        """
+        if self.asset is None:
+            return False
+        name_differs = ((self.requester_name or "").strip().lower()
+                        != (self.asset.owner_name or "").strip().lower())
+        email_differs = ((self.requester_email or "").strip().lower()
+                         != (self.asset.owner_email or "").strip().lower())
+        return bool(name_differs or email_differs)
+
+    def to_dict(self, include_detail: bool = False) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "assetId": self.asset_id,
+            "wgtCode": self.wgt_code,
+            "assetName": self.asset_name,
+            "fields": list(self.fields or []),
+            "fieldLabels": [reference.update_field_label(f) for f in (self.fields or [])],
+            "requesterName": self.requester_name or "",
+            "requesterEmail": self.requester_email or "",
+            "status": self.status,
+            "submittedDate": _iso_date(self.created_at),
+            "resolvedDate": _iso_date(self.resolved_at),
+        }
+        if include_detail:
+            data.update({
+                "proposed": self.proposed or {},
+                "notes": self.notes or "",
+                "resolutionNote": self.resolution_note or "",
+                "ownerMismatch": self.owner_mismatch(),
+                "assetExists": self.asset is not None,
+                "assetOwner": (self.asset.owner_name or "") if self.asset else "",
+                "assetOwnerEmail": (self.asset.owner_email or "") if self.asset else "",
+                "assetType": self.asset.asset_type if self.asset else None,
+                "files": {
+                    key: [f.to_dict() for f in self.files_for(key)]
+                    for key in ("knowledgeFiles", "contextFiles")
+                },
+            })
+        return data
+
+    def __repr__(self) -> str:
+        return "<UpdateRequest {0} {1} ({2})>".format(self.id, self.wgt_code, self.status)
+
+
+# Which AssetFile.kind backs each proposed-files field.
+_FILES_KEY_TO_KIND = {"knowledgeFiles": "knowledge", "contextFiles": "context"}

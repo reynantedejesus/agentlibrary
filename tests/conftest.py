@@ -48,16 +48,12 @@ def app(upload_dir):
     # the next — something that never happens in production, where every
     # request gets its own app context.
     #
-    # Two extensions cache on ``g`` and both matter here:
-    #   * flask_login  -> g._login_user  (identity resolution)
-    #   * flask_wtf    -> g.csrf_token   (the signed CSRF token)
-    # Leaving the CSRF cache in place would break the login flow specifically,
-    # because login calls session.clear() and then relies on generate_csrf()
-    # re-seeding session["csrf_token"] — which it skips when g already holds a
-    # token. Clearing both keeps the harness faithful to production.
+    # flask_wtf caches the signed CSRF token on ``g``. Leaving it in place
+    # would break the unlock flow specifically, because unlocking calls
+    # session.clear() and then relies on generate_csrf() re-seeding
+    # session["csrf_token"] — which it skips when g already holds a token.
     @application.before_request
     def _reset_per_request_caches():
-        g.pop("_login_user", None)
         g.pop("csrf_token", None)
 
     with application.app_context():
@@ -77,54 +73,45 @@ def client(app):
     return app.test_client()
 
 
-def make_user(email, role="user", name=None, password=PASSWORD, active=True):
-    user = User(email=email, full_name=name or email.split("@")[0].title(), role=role)
+def make_admin(email="admin@wings.test", name="WGT Automation", password=PASSWORD):
+    """The single administrator row whose hash backs the console password."""
+    user = User(email=email, full_name=name, role="admin")
     user.set_password(password)
-    user.is_active_flag = active
     _db.session.add(user)
     _db.session.commit()
     return user
 
 
-@pytest.fixture()
-def normal_user(app):
-    return make_user("uma@wings.test", "user", "Uma User")
-
-
-@pytest.fixture()
-def reviewer_user(app):
-    return make_user("rob@wings.test", "reviewer", "Rob Reviewer")
+def unlock(client, password=PASSWORD):
+    """Enter the shared admin password, as the console prompt does."""
+    return client.post("/api/auth/unlock", json={"password": password})
 
 
 @pytest.fixture()
 def admin_user(app):
-    return make_user("ada@wings.test", "admin", "Ada Admin")
-
-
-def login(client, email, password=PASSWORD):
-    return client.post("/api/auth/login", json={"email": email, "password": password})
+    return make_admin()
 
 
 @pytest.fixture()
-def as_user(client, normal_user):
-    login(client, normal_user.email)
-    return client
+def visitor(app):
+    """A separate client that is definitely NOT unlocked.
 
-
-@pytest.fixture()
-def as_reviewer(client, reviewer_user):
-    login(client, reviewer_user.email)
-    return client
+    ``as_admin`` unlocks the shared ``client``, so a test that needs both an
+    admin and an ordinary visitor must not reuse ``client`` for the latter.
+    """
+    return app.test_client()
 
 
 @pytest.fixture()
 def as_admin(client, admin_user):
-    login(client, admin_user.email)
+    """A client with the Admin / Review console unlocked."""
+    response = unlock(client)
+    assert response.status_code == 200, response.get_json()
     return client
 
 
 def asset_payload(**overrides):
-    """A valid Add-to-Library submission."""
+    """A valid Add-to-Library submission. No credentials: submitting is open."""
     payload = {
         "type": "gpt",
         "department": "Finance",
@@ -146,9 +133,56 @@ def create_asset(client, **overrides):
     return response.get_json()["data"]["asset"]
 
 
+def approve(client, asset_id):
+    """Approve an asset with an already-unlocked client."""
+    response = client.post("/api/assets/%d/approve" % asset_id)
+    assert response.status_code == 200, response.get_json()
+    return response.get_json()["data"]["asset"]
+
+
+def publish(app, client, **overrides):
+    """Submit anonymously, then approve on a separate unlocked client.
+
+    Keeps ``client`` locked, which is what most tests want as a starting
+    point — the catalogue is public but the console is not. Creates the
+    administrator row if the test did not ask for one.
+    """
+    asset = create_asset(client, **overrides)
+    if User.query.filter_by(role="admin").first() is None:
+        make_admin()
+    admin = app.test_client()
+    response = unlock(admin)
+    assert response.status_code == 200, response.get_json()
+    return approve(admin, asset["id"])
+
+
+def stage_file(client, name="notes.md", content=b"# notes\n"):
+    """Upload a file that nothing owns yet, as the dropzone does."""
+    import io
+    response = client.post(
+        "/api/uploads",
+        data={"file": (io.BytesIO(content), name)},
+        content_type="multipart/form-data")
+    assert response.status_code == 201, response.get_json()
+    return response.get_json()["data"]["file"]
+
+
+def update_request_payload(asset_id, **overrides):
+    payload = {
+        "assetId": asset_id,
+        "fields": ["description"],
+        "proposed": {"description": "Now drafts board and exec commentary."},
+        "notes": "Prompt was rewritten.",
+        "requesterName": "Uma User",
+        "requesterEmail": "uma@wings.test",
+    }
+    payload.update(overrides)
+    return payload
+
+
 @pytest.fixture()
-def submitted_asset(as_user):
-    return create_asset(as_user)
+def submitted_asset(client):
+    return create_asset(client)
 
 
 def body(response):

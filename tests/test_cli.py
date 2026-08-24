@@ -5,7 +5,7 @@ import pytest
 
 from app.extensions import db
 from app.models import ActivityLog, Asset, ConfigSetting, User, WgtCounter
-from tests.conftest import login
+from tests.conftest import unlock
 
 GOOD_PASSWORD = "CorrectHorseBattery9"
 
@@ -87,30 +87,14 @@ def test_create_admin_is_audited(runner, monkeypatch):
     assert entry.detail["role"] == "admin"
 
 
-def test_created_admin_can_actually_sign_in(app, runner, monkeypatch):
+def test_created_admin_password_unlocks_the_console(app, runner, monkeypatch):
     monkeypatch.setenv("ADMIN_INITIAL_PASSWORD", GOOD_PASSWORD)
     runner.invoke(args=["create-admin", "--email", "ada@wings.test"])
     client = app.test_client()
-    response = login(client, "ada@wings.test", GOOD_PASSWORD)
+    response = unlock(client, GOOD_PASSWORD)
     assert response.status_code == 200
-    assert response.get_json()["data"]["user"]["role"] == "admin"
-    assert client.get("/api/admin/users").status_code == 200
-
-
-def test_create_user_supports_the_reviewer_role(runner, monkeypatch):
-    monkeypatch.setenv("ADMIN_INITIAL_PASSWORD", GOOD_PASSWORD)
-    result = runner.invoke(args=["create-user", "--email", "rob@wings.test",
-                                 "--role", "reviewer"])
-    assert result.exit_code == 0, result.output
-    assert User.query.filter_by(email="rob@wings.test").one().role == "reviewer"
-
-
-def test_set_role_changes_an_existing_account(runner, normal_user):
-    result = runner.invoke(args=["set-role", "--email", normal_user.email,
-                                 "--role", "reviewer"])
-    assert result.exit_code == 0, result.output
-    db.session.refresh(normal_user)
-    assert normal_user.role == "reviewer"
+    assert response.get_json()["data"]["unlocked"] is True
+    assert client.get("/api/admin/stats").status_code == 200
 
 
 def test_seed_config_writes_reference_rows_and_counters(runner):
@@ -138,6 +122,20 @@ def test_seed_config_is_idempotent(runner):
     assert "Reference rows written: 0" in second.output
 
 
+def _strip_python_prose(source):
+    """Remove ``#`` comments and triple-quoted blocks (docstrings).
+
+    A real hard-coded credential would be an ordinary single-quoted literal,
+    so those are left in place. Docstrings are dropped because the modules
+    legitimately *describe* the prototype's plaintext password when explaining
+    what replaced it — scanning raw text would flag the documentation.
+    """
+    import re
+    source = re.sub(r'"""[\s\S]*?"""', "", source)
+    source = re.sub(r"'''[\s\S]*?'''", "", source)
+    return re.sub(r"(?m)#.*$", "", source)
+
+
 def test_no_password_is_hard_coded_anywhere_in_the_source():
     """Grep the shipped source for the prototype's plaintext credential."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -153,9 +151,12 @@ def test_no_password_is_hard_coded_anywhere_in_the_source():
                 continue
             with open(path, "r", encoding="utf-8", errors="ignore") as handle:
                 content = handle.read()
-            if "Wings123+" in content and "startswith" not in content:
+            code = (_strip_python_prose(content) if filename.endswith(".py")
+                    else _strip_comments(content, filename))
+            # validators.py legitimately refuses this value as a weak password.
+            if "Wings123" in code and "startswith" not in code:
                 offenders.append(path)
-            if "defaultAdminPassword" in content:
+            if "defaultAdminPassword" in code:
                 offenders.append(path)
     assert offenders == [], "hard-coded credential found in: %r" % offenders
 
@@ -194,14 +195,15 @@ def test_no_client_side_auth_or_mock_data_remains():
         with open(os.path.join(root, relative), encoding="utf-8") as handle:
             code = _strip_comments(handle.read(), relative)
         for banned in ("buildMockAssets", "AdminAuth", "defaultAdminPassword",
-                       "wgt_agent_library_v1", "Wings123", "makeAsset("):
+                       "wgt_agent_library_v1", "Wings123", "makeAsset(",
+                       "checkPassword("):
             assert banned not in code, "%s still references %s" % (relative, banned)
 
 
-def test_prune_activity_respects_the_retention_window(runner, app, as_user):
+def test_prune_activity_respects_the_retention_window(runner, app, client):
     import datetime as dt
     from tests.conftest import create_asset
-    create_asset(as_user)
+    create_asset(client)
     old = ActivityLog.query.first()
     old.ts = dt.datetime.utcnow() - dt.timedelta(days=900)
     db.session.commit()
@@ -211,12 +213,56 @@ def test_prune_activity_respects_the_retention_window(runner, app, as_user):
     assert ActivityLog.query.count() == before - 1
 
 
-def test_show_status_reports_an_inventory(runner, as_user):
+def test_show_status_reports_an_inventory(runner, client):
     from tests.conftest import create_asset
-    create_asset(as_user)
+    create_asset(client)
     result = runner.invoke(args=["show-status"])
     assert result.exit_code == 0, result.output
     assert "Assets    : 1" in result.output
     assert "Pending Review" in result.output
     # The database password must never be printed.
     assert "password" not in result.output.lower()
+
+
+def test_prune_uploads_sweeps_unclaimed_files(runner, app, client, upload_dir):
+    """A form abandoned after attaching a file must not leak bytes on disk."""
+    import datetime as dt
+    import os
+
+    from app.models import AssetFile
+    from tests.conftest import stage_file
+
+    staged = stage_file(client, "orphan.md")
+    row = db.session.get(AssetFile, staged["id"])
+    absolute = os.path.join(upload_dir, row.relative_path)
+    assert os.path.isfile(absolute)
+
+    # Too recent to sweep.
+    result = runner.invoke(args=["prune-uploads", "--hours", "24", "--yes"])
+    assert result.exit_code == 0
+    assert AssetFile.query.count() == 1
+
+    row.created_at = dt.datetime.utcnow() - dt.timedelta(hours=48)
+    db.session.commit()
+    result = runner.invoke(args=["prune-uploads", "--hours", "24", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert AssetFile.query.count() == 0
+    assert not os.path.exists(absolute)
+
+
+def test_prune_uploads_leaves_claimed_files_alone(runner, app, client, upload_dir):
+    import datetime as dt
+
+    from app.models import AssetFile
+    from tests.conftest import create_asset, stage_file
+
+    staged = stage_file(client, "kept.md")
+    create_asset(client, knowledgeFileIds=[staged["id"]])
+
+    row = db.session.get(AssetFile, staged["id"])
+    row.created_at = dt.datetime.utcnow() - dt.timedelta(days=30)
+    db.session.commit()
+
+    result = runner.invoke(args=["prune-uploads", "--hours", "1", "--yes"])
+    assert result.exit_code == 0
+    assert AssetFile.query.count() == 1        # claimed, so untouched

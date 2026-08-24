@@ -30,11 +30,13 @@ counter rows, legacy import).
 from __future__ import annotations
 
 import logging
+import random
 import re
+import time
 from typing import Optional
 
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app import reference
 from app.errors import Conflict
@@ -45,7 +47,14 @@ log = logging.getLogger(__name__)
 
 WGT_PATTERN = re.compile(r"^WGT(\d+)$")
 SEQUENCE_PAD = 2
-MAX_ALLOCATION_ATTEMPTS = 6
+# Retries are cheap and a caller who exhausts them gets a 409 for something
+# that is not their fault, so be generous. On MySQL the row lock makes
+# collisions rare; on SQLite (no row locks, file-level contention) several
+# concurrent submitters really can collide repeatedly.
+MAX_ALLOCATION_ATTEMPTS = 12
+# Jittered backoff so colliding transactions do not retry in lockstep.
+RETRY_BASE_DELAY = 0.02
+RETRY_MAX_DELAY = 0.4
 
 
 def prefix_for_department(department: str) -> str:
@@ -161,6 +170,16 @@ def allocate_with_retry(department: str, insert_callback, attempts: int = MAX_AL
             result = insert_callback(code)
             db.session.commit()
             return result
+        except OperationalError as exc:
+            # e.g. SQLite's "database is locked" under concurrent writers.
+            db.session.rollback()
+            last_error = exc
+            log.warning("WGT allocation contention on attempt %s for %s",
+                        attempt, department)
+            if attempt < attempts:
+                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+                time.sleep(random.uniform(0, delay))
+            continue
         except IntegrityError as exc:
             db.session.rollback()
             last_error = exc
@@ -170,6 +189,11 @@ def allocate_with_retry(department: str, insert_callback, attempts: int = MAX_AL
             log.warning("WGT allocation collision on attempt %s for %s: %s",
                         attempt, department, message[:200])
             _resync_counter(department)
+            if attempt < attempts:
+                # Exponential backoff with full jitter. Without this, two
+                # transactions that collide tend to collide again immediately.
+                delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+                time.sleep(random.uniform(0, delay))
     log.error("Exhausted WGT allocation attempts for %s", department)
     raise Conflict(
         "Could not allocate a WGT reference code — please try again.",

@@ -19,9 +19,10 @@ Apply with::
 
     FLASK_APP=wsgi.py flask db upgrade
 
-Roll back one revision with::
+Roll back one revision with (``--`` because Click reads a bare ``-1`` as an
+option)::
 
-    FLASK_APP=wsgi.py flask db downgrade -1
+    FLASK_APP=wsgi.py flask db downgrade -- -1
 
 Revision ID: 0001_initial
 Revises:

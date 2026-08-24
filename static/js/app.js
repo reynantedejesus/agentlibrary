@@ -6,12 +6,12 @@
      1. BOOTSTRAP & API CLIENT  — fetch wrapper, CSRF, HTTP error handling
      2. UTILITIES                — dates, badges, icons, clipboard, toast, escaping
      3. APP STATE & ROUTER        — current view / filters / wizard state / history
-     4. AUTH UI                    — sign in, sign out, change password
+     4. ADMIN UNLOCK                — the shared-password gate
      5. SIDEBAR & TOPBAR            — chrome rendering
      6. LIBRARY VIEW                 — search, filter ribbon, cards/list, sections
-     7. DETAIL PANEL                  — overview / how-to / config / files / versions
+     7. DETAIL PANEL                  — overview / configuration / version history
      8. WIZARD (ADD TO LIBRARY)        — two-step submission flow
-     9. MY SUBMISSIONS                  — per-user buckets
+     9. UPDATE AN AGENT                 — propose a change to a published tool
     10. ADMIN / REVIEW                   — governance dashboard
     11. INIT                              — bootstrap
 
@@ -20,8 +20,10 @@
    `Api` object in section 1, which talks to the Flask JSON API over fetch()
    with `credentials: "same-origin"` so the HttpOnly session cookie travels
    with each request. There is no localStorage, no mock data, and no
-   client-side password check anywhere in this file — authorisation decisions
-   shown in the UI are *hints*; the server enforces all of them again.
+   client-side password check anywhere in this file — the admin password is
+   posted to the server and compared against a hash there. `State.unlocked`
+   only decides what to *draw*; every protected endpoint re-checks the session,
+   so editing it from the console grants nothing.
 
    RENDERING SAFETY
    Views are built as HTML strings and assigned with innerHTML, matching the
@@ -41,9 +43,10 @@
 /** Server-rendered bootstrap payload (see templates/index.html). */
 const BOOT = (function readBootstrap(){
   const node = document.getElementById("bootstrap-data");
-  if (!node) return { user: null, version: "" };
-  try { return JSON.parse(node.textContent) || { user: null, version: "" }; }
-  catch (e) { return { user: null, version: "" }; }
+  const fallback = { unlocked: false, version: "" };
+  if (!node) return fallback;
+  try { return JSON.parse(node.textContent) || fallback; }
+  catch (e) { return fallback; }
 })();
 
 /** Reference data from GET /api/config. Populated during init(); the app
@@ -52,7 +55,7 @@ let CONFIG = null;
 
 const HTTP_MESSAGES = {
   400: "That request wasn't valid.",
-  401: "Your session has ended — sign in to continue.",
+  401: "Your admin session has ended — enter the password again.",
   403: "You don't have permission to do that.",
   404: "That item no longer exists. It may have been removed.",
   409: "That conflicts with a change someone else made. Reload and try again.",
@@ -144,13 +147,12 @@ const Api = {
     throw error;
   },
 
-  /** Cross-cutting reactions: a 401 means the session died underneath us, so
-      drop the cached identity and re-render the chrome. */
+  /** Cross-cutting reactions: a 401 means the admin session expired under us,
+      so drop the cached flag and re-render the chrome. */
   _handleGlobal(error){
-    if (error.status === 401 && State.user){
-      State.user = null;
+    if (error.status === 401 && State.unlocked){
+      State.unlocked = false;
       renderSidebarNav();
-      renderTopbarActions();
     }
     if (error.status === 400 && error.code === "CSRF_INVALID"){
       // Pull a fresh token so the user's retry succeeds.
@@ -175,7 +177,7 @@ function reportError(error, fallback){
   if (error instanceof ApiError){
     if (error.isAuth){
       Toast.show(error.message || HTTP_MESSAGES[401], "error");
-      openLoginModal();
+      promptUnlock();
       return error;
     }
     Toast.show(error.message || fallback || "Something went wrong.", "error");
@@ -293,6 +295,14 @@ const Util = {
     }
   },
 
+  /** Human-readable byte count, matching the server's AssetFile.human_size. */
+  formatBytes(bytes){
+    if (bytes === null || bytes === undefined) return "—";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  },
+
   fileIconLabel(ext){
     const icons = (CONFIG && CONFIG.fileTypeIcons) || {};
     return icons[ext] || "FILE";
@@ -331,6 +341,7 @@ const Icon = {
   user: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="8" r="3.5" stroke="currentColor" stroke-width="1.8"/><path d="M4.5 20a7.5 7.5 0 0115 0" stroke="currentColor" stroke-width="1.8"/></svg>`,
   shield: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" stroke="currentColor" stroke-width="1.8"/></svg>`,
   clock: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7v5l3.5 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+  edit: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 20h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
   upload: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`,
   signout: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M14 8V6a1 1 0 00-1-1H6a1 1 0 00-1 1v12a1 1 0 001 1h7a1 1 0 001-1v-2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><path d="M10 12h10m0 0l-3-3m3 3l-3 3" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
 };
@@ -360,8 +371,8 @@ const Toast = {
    3. APP STATE & ROUTER
    ============================================================================ */
 const State = {
-  view: "library",              // library | add | my | admin
-  user: BOOT.user || null,      // {id,email,fullName,role} or null
+  view: "library",              // library | add | update | admin
+  unlocked: !!BOOT.unlocked,    // is the Admin / Review console open?
   detailAssetId: null,
   detailTab: "overview",
   loading: false,
@@ -375,7 +386,18 @@ const State = {
     result: null,               // last /api/assets payload
   },
 
-  my: { query: "", result: null },
+  update: {                     // "Update an Agent" form
+    searchQuery: "",
+    assetId: "",
+    asset: null,
+    fields: [],
+    proposed: {},
+    files: { knowledgeFiles: [], contextFiles: [] },
+    notes: "",
+    requesterName: "",
+    requesterEmail: "",
+    submitting: false,
+  },
 
   admin: {
     tab: "pending",             // pending | manage | activity
@@ -383,19 +405,17 @@ const State = {
     pending: null,
     manage: null,
     activity: null,
+    updates: null,
     stats: null,
   },
 
   wizard: null,
   detailAsset: null,            // full detail payload for the open asset
-  detailFiles: null,
 };
 
-function isAuthenticated(){ return !!State.user; }
-function roleRank(role){ return { user:10, reviewer:20, admin:30 }[role] || 0; }
-function hasRole(minimum){ return isAuthenticated() && roleRank(State.user.role) >= roleRank(minimum); }
-function isReviewer(){ return hasRole("reviewer"); }
-function isAdmin(){ return hasRole("admin"); }
+/** Whether the Admin / Review console is currently open in this browser.
+    A rendering hint only — the server decides on every request. */
+function isAdmin(){ return !!State.unlocked; }
 
 /* ---- Browser back/forward support --------------------------------------
    Hash bookkeeping, extended from the prototype so an open asset is
@@ -404,7 +424,7 @@ function isAdmin(){ return hasRole("admin"); }
    Forward behave the way they did before. _suppressHashChange stops the
    write we make ourselves from bouncing back in as an incoming event. ---- */
 let _suppressHashChange = false;
-const VIEWS = ["library", "add", "my", "admin"];
+const VIEWS = ["library", "add", "update", "admin"];
 
 function updateHashForView(){
   const hash = State.detailAssetId ? ("asset/" + State.detailAssetId) : State.view;
@@ -428,30 +448,26 @@ function applyViewFromHash(){
 
 const VIEW_TITLES = {
   library: "Library", add: "Add to Library",
-  my: "My Submissions", admin: "Admin / Review",
+  update: "Update an Agent", admin: "Admin / Review",
 };
 const VIEW_CRUMBS = {
   library: "Agent Library",
   add: "Agent Library · New submission",
-  my: "Agent Library · Your submissions",
+  update: "Agent Library · Update an Agent",
   admin: "Agent Library · Governance",
 };
 
-/** Views that need a signed-in user before they will render anything. */
-const VIEW_REQUIREMENTS = { add: "user", my: "user", admin: "reviewer" };
+/** Only the governance console is gated. Browsing, submitting and raising an
+    update request are all open, matching the prototype. */
+const GATED_VIEWS = ["admin"];
 
 function setView(view, skipHash){
-  const requirement = VIEW_REQUIREMENTS[view];
-  if (requirement && !hasRole(requirement)){
-    if (!isAuthenticated()){
-      openLoginModal(() => setView(view));
-      // Leave the chrome on a view the visitor is allowed to see.
-      if (!VIEW_REQUIREMENTS[State.view]) return;
-      view = "library";
-    } else {
-      Toast.show("The " + VIEW_TITLES[view] + " area needs the " + requirement + " role.", "error");
-      view = "library";
-    }
+  if (GATED_VIEWS.indexOf(view) !== -1 && !isAdmin()){
+    // Ask for the password, then land on the view once it is accepted.
+    promptUnlock(() => setView(view));
+    // Stay where we are meanwhile, unless that was also gated.
+    if (GATED_VIEWS.indexOf(State.view) === -1) return;
+    view = "library";
   }
 
   if (view === "admin" && State.view !== "admin"){
@@ -459,6 +475,7 @@ function setView(view, skipHash){
     State.admin.librarySearch = "";
     State.admin.tab = "pending";
   }
+  if (view === "update" && State.view !== "update") resetUpdateForm();
   if (view === "library" && State.view !== "library") State.library.page = 1;
 
   State.view = view;
@@ -484,7 +501,7 @@ async function render(){
   try {
     if (State.view === "library") await renderLibraryView();
     else if (State.view === "add") await renderWizardView();
-    else if (State.view === "my") await renderMySubmissionsView();
+    else if (State.view === "update") await renderUpdateRequestView();
     else if (State.view === "admin") await renderAdminView();
     renderSidebarNav();
   } catch (error){
@@ -512,117 +529,110 @@ function renderLoading(label){
 }
 
 /* ============================================================================
-   4. AUTH UI
-   Replaces the prototype's AdminAuth password prompt. No password is ever
-   compared here — the browser posts credentials and the server decides.
+   4. ADMIN UNLOCK
+   ----------------------------------------------------------------------------
+   Replaces the prototype's AdminAuth module, which compared the typed value
+   against a constant sitting in the page source. Nothing is compared here:
+   the password is POSTed to /api/auth/unlock and checked against a hash on
+   the server, which then sets an HttpOnly session cookie. This file never
+   sees, stores, or decides anything about the password.
    ============================================================================ */
 async function refreshSession(){
   try {
     const data = await Api.get("/api/auth/me");
-    State.user = data.user;
+    State.unlocked = !!data.unlocked;
+    State.adminConfigured = data.adminConfigured !== false;
     Api.setCsrf(data.csrfToken);
   } catch (e){
-    State.user = null;
+    State.unlocked = false;
   }
-  return State.user;
+  return State.unlocked;
 }
 
-function openLoginModal(onSuccess){
-  showModal("Sign in", `
-    <p class="hint" style="margin-top:0;">Sign in with your Wings account to submit
-      assets or review submissions.</p>
-    <form id="login-form" novalidate>
+/** The Admin / Review password prompt. `onSuccess` runs once accepted. */
+function promptUnlock(onSuccess){
+  showModal("Admin password required", `
+    <p class="hint" style="margin-top:0;">The Admin / Review console is password
+      protected. Enter the admin password to continue.</p>
+    <form id="unlock-form" novalidate>
       <div class="field">
-        <label for="login-email">Email</label>
-        <input class="input" type="email" id="login-email" autocomplete="username"
-               required aria-describedby="login-error">
+        <label for="unlock-password">Password</label>
+        <input class="input" type="password" id="unlock-password"
+               autocomplete="current-password" placeholder="Enter password"
+               aria-describedby="unlock-error">
       </div>
-      <div class="field">
-        <label for="login-password">Password</label>
-        <input class="input" type="password" id="login-password"
-               autocomplete="current-password" required aria-describedby="login-error">
-      </div>
-      <div id="login-error" class="warn-banner" role="alert"
+      <div id="unlock-error" class="warn-banner" role="alert"
            style="display:none;margin-top:12px;">${Icon.warn}<span></span></div>
-      <button type="submit" class="sr-only">Sign in</button>
+      <button type="submit" class="sr-only">Unlock</button>
     </form>
   `, [
     { label:"Cancel", cls:"btn-secondary", onClick: closeModal },
-    { label:"Sign in", cls:"btn-primary", id:"login-submit", onClick: () => submitLogin(onSuccess) },
+    { label:"Unlock", cls:"btn-primary", id:"unlock-submit",
+      onClick: () => submitUnlock(onSuccess) },
   ]);
 
-  const form = document.getElementById("login-form");
-  if (form) form.addEventListener("submit", e => { e.preventDefault(); submitLogin(onSuccess); });
-  const email = document.getElementById("login-email");
-  if (email) email.focus();
+  const form = document.getElementById("unlock-form");
+  if (form) form.addEventListener("submit", e => { e.preventDefault(); submitUnlock(onSuccess); });
+  const input = document.getElementById("unlock-password");
+  if (input) input.focus();
 }
 
-async function submitLogin(onSuccess){
-  const emailField = document.getElementById("login-email");
-  const passwordField = document.getElementById("login-password");
-  const errorBox = document.getElementById("login-error");
-  const button = document.getElementById("login-submit");
-  if (!emailField || !passwordField) return;
+async function submitUnlock(onSuccess){
+  const input = document.getElementById("unlock-password");
+  const errorBox = document.getElementById("unlock-error");
+  const button = document.getElementById("unlock-submit");
+  if (!input) return;
 
   const showError = (message) => {
     if (!errorBox) return;
     errorBox.style.display = "flex";
     errorBox.querySelector("span").textContent = message;
-    passwordField.value = "";
-    passwordField.focus();
+    input.value = "";
+    input.focus();
   };
 
-  if (!emailField.value.trim() || !passwordField.value){
-    showError("Enter your email address and password.");
-    return;
-  }
+  if (!input.value){ showError("Enter the admin password."); return; }
 
-  if (button){ button.disabled = true; button.textContent = "Signing in…"; }
+  if (button){ button.disabled = true; button.textContent = "Checking…"; }
   try {
-    const data = await Api.post("/api/auth/login", {
-      email: emailField.value.trim(),
-      password: passwordField.value,
-    });
-    State.user = data.user;
+    const data = await Api.post("/api/auth/unlock", { password: input.value });
+    State.unlocked = true;
     Api.setCsrf(data.csrfToken);
     closeModal();
-    Toast.show("Signed in as " + data.user.fullName, "success");
+    Toast.show("Unlocked for this session", "success");
     renderSidebarNav();
-    renderTopbarActions();
-    // The Admin pending pill is role-dependent, so it has to be recomputed for
-    // the identity that just signed in — not carried over from the last one.
-    refreshPendingCount();
+    refreshAdminCounts();
     if (typeof onSuccess === "function") onSuccess();
     else render();
   } catch (error){
-    showError(error instanceof ApiError ? error.message : "Sign-in failed.");
+    showError(error instanceof ApiError ? error.message : "Incorrect password.");
   } finally {
-    if (button){ button.disabled = false; button.textContent = "Sign in"; }
+    if (button){ button.disabled = false; button.textContent = "Unlock"; }
   }
 }
 
-async function doLogout(){
+async function doLock(){
   try {
-    const data = await Api.post("/api/auth/logout");
+    const data = await Api.post("/api/auth/lock");
     Api.setCsrf(data.csrfToken);
   } catch (e){ /* the session is going away regardless */ }
-  State.user = null;
+  State.unlocked = false;
   _pendingCount = 0;
-  Toast.show("Signed out", "info");
+  Toast.show("Admin console locked", "info");
   renderSidebarNav();
-  renderTopbarActions();
   setView("library");
 }
 
 function openChangePasswordModal(){
   const minimum = (CONFIG && CONFIG.limits && CONFIG.limits.minPasswordLength) || 12;
-  showModal("Change password", `
+  showModal("Change admin password", `
     <form id="pw-form" novalidate>
       <div class="field"><label for="pw-current">Current password</label>
         <input class="input" type="password" id="pw-current" autocomplete="current-password"></div>
       <div class="field"><label for="pw-new">New password</label>
         <input class="input" type="password" id="pw-new" autocomplete="new-password">
-        <div class="hint">At least ${h(minimum)} characters.</div></div>
+        <div class="hint">At least ${h(minimum)} characters. Everyone using the old
+          password will need the new one.</div></div>
       <div class="field"><label for="pw-confirm">Confirm new password</label>
         <input class="input" type="password" id="pw-confirm" autocomplete="new-password"></div>
       <div id="pw-error" class="warn-banner" role="alert"
@@ -659,9 +669,9 @@ async function submitPasswordChange(){
       currentPassword: current, newPassword: next, confirmPassword: confirm,
     });
     Api.setCsrf(data.csrfToken);
-    State.user = data.user;
+    State.unlocked = true;
     closeModal();
-    Toast.show("Password updated", "success");
+    Toast.show("Admin password updated", "success");
   } catch (error){
     const message = error instanceof ApiError
       ? (Object.values(error.fields)[0] || error.message)
@@ -680,10 +690,10 @@ let _pendingCount = 0;
 function renderSidebarNav(){
   const items = [
     { view:"library", label:"Library", icon:Icon.library },
-    { view:"add", label:"Add to Library", icon:Icon.addSquare, locked: !isAuthenticated() },
-    { view:"my", label:"My Submissions", icon:Icon.user, locked: !isAuthenticated() },
+    { view:"add", label:"Add to Library", icon:Icon.addSquare },
+    { view:"update", label:"Update an Agent", icon:Icon.edit },
     { view:"admin", label:"Admin / Review", icon:Icon.shield,
-      count: _pendingCount, locked: !isReviewer() },
+      count: _pendingCount, locked: !isAdmin() },
   ];
   const nav = document.getElementById("nav-list");
   if (!nav) return;
@@ -691,9 +701,9 @@ function renderSidebarNav(){
     <li>
       <button class="nav-item ${State.view === it.view ? "active" : ""}"
               data-view="${h(it.view)}"
-              ${it.locked ? 'title="Sign in required" aria-describedby="live-region"' : ""}>
+              ${it.locked ? 'title="Password protected"' : ""}>
         ${it.icon}<span>${h(it.label)}</span>
-        ${it.locked ? `<span class="nav-lock" aria-label="Sign in required">${Icon.lock}</span>` : ""}
+        ${it.locked ? `<span class="nav-lock" aria-label="Password protected">${Icon.lock}</span>` : ""}
         ${(!it.locked && it.count) ? `<span class="count-pill">${h(it.count)}</span>` : ""}
       </button>
     </li>`).join("");
@@ -706,41 +716,36 @@ function renderSidebarNav(){
 function renderSidebarAccount(){
   const box = document.getElementById("sidebar-account");
   if (!box) return;
-  if (!isAuthenticated()){
-    box.innerHTML = `<button class="sidebar-signin" id="sidebar-signin">${Icon.user}
-      <span>Sign in</span></button>`;
-    const btn = document.getElementById("sidebar-signin");
-    if (btn) btn.onclick = () => openLoginModal();
+  if (!isAdmin()){
+    // Nothing to show: browsing and submitting need no credentials at all.
+    box.innerHTML = "";
     return;
   }
   box.innerHTML = `
     <div class="sidebar-user">
-      <div class="su-name">${h(State.user.fullName || State.user.email)}</div>
-      <div class="su-role">${h(State.user.role)}</div>
+      <div class="su-name">Admin console</div>
+      <div class="su-role">unlocked</div>
       <div class="su-actions">
         <button class="su-link" id="sidebar-change-pw">Change password</button>
-        <button class="su-link" id="sidebar-signout">${Icon.signout} Sign out</button>
+        <button class="su-link" id="sidebar-lock">${Icon.signout} Lock console</button>
       </div>
     </div>`;
   const pw = document.getElementById("sidebar-change-pw");
   if (pw) pw.onclick = openChangePasswordModal;
-  const out = document.getElementById("sidebar-signout");
-  if (out) out.onclick = doLogout;
+  const out = document.getElementById("sidebar-lock");
+  if (out) out.onclick = doLock;
 }
 
-function renderTopbarActions(){
-  const box = document.getElementById("topbar-actions");
-  if (box) box.innerHTML = "";
-  const addBtn = document.getElementById("topbar-add-btn");
-  if (addBtn) addBtn.hidden = false;
-}
-
-/** Keeps the Admin nav pill honest without pulling the whole queue. */
-async function refreshPendingCount(){
-  if (!isReviewer()){ _pendingCount = 0; return; }
+/** Keeps the Admin nav pill honest without pulling the whole queue.
+    Counts pending submissions plus open update requests, as v41 does. */
+async function refreshAdminCounts(){
+  if (!isAdmin()){ _pendingCount = 0; renderSidebarNav(); return; }
   try {
-    const data = await Api.get("/api/assets", { status: "Pending Review", per_page: 1 });
-    _pendingCount = data.total || 0;
+    const [assets, updates] = await Promise.all([
+      Api.get("/api/assets", { status: "Pending Review", per_page: 1 }),
+      Api.get("/api/update-requests", { status: "Open", per_page: 1 }),
+    ]);
+    _pendingCount = (assets.total || 0) + (updates.openCount || 0);
   } catch (e){ _pendingCount = 0; }
   renderSidebarNav();
 }
@@ -1127,7 +1132,7 @@ function wireOpenHandlers(scope){
 function findLoadedAsset(id){
   const pools = [
     State.library.result && State.library.result.items,
-    State.my.result && State.my.result.items,
+    State.update && State.update.asset ? [State.update.asset] : null,
     State.admin.pending && State.admin.pending.items,
     State.admin.manage && State.admin.manage.items,
     State.detailAsset ? [State.detailAsset] : null,
@@ -1150,7 +1155,6 @@ async function openDetail(assetId, skipHash){
   State.detailAssetId = assetId;
   State.detailTab = "overview";
   State.detailAsset = null;
-  State.detailFiles = null;
 
   const overlay = document.getElementById("detail-overlay");
   const panel = document.getElementById("detail-panel");
@@ -1176,7 +1180,6 @@ function closeDetail(skipHash){
   document.getElementById("detail-panel").innerHTML = "";
   State.detailAssetId = null;
   State.detailAsset = null;
-  State.detailFiles = null;
   if (!skipHash) updateHashForView();
   if (_lastFocusBeforeOverlay && document.contains(_lastFocusBeforeOverlay)){
     _lastFocusBeforeOverlay.focus();
@@ -1190,9 +1193,11 @@ function renderDetail(){
   if (!asset){ panel.innerHTML = ""; return; }
 
   const m = Util.typeMeta(asset.type);
+  // v41 trimmed this from five tabs to three: "How to Use" and
+  // "Files & Resources" were removed. The underlying fields still exist on
+  // every record and in the API, so the tabs can return without a migration.
   const tabs = [
-    ["overview","Overview"], ["howto","How to Use"], ["config","Configuration"],
-    ["files","Files & Resources"], ["versions","Version History"],
+    ["overview","Overview"], ["config","Configuration"], ["versions","Version History"],
   ];
   const hasUrl = !!Util.safeExternalUrl(asset.directUrl);
   // Server-supplied capability hints. The server re-checks every one of these
@@ -1251,9 +1256,7 @@ function renderDetail(){
 
 function renderPane(id, asset){
   if (id === "overview") return renderPaneOverview(asset);
-  if (id === "howto") return renderPaneHowTo(asset);
   if (id === "config") return renderPaneConfig(asset);
-  if (id === "files") return renderPaneFiles(asset);
   if (id === "versions") return renderPaneVersions(asset);
   return "";
 }
@@ -1265,7 +1268,6 @@ function renderPaneOverview(asset){
   <div class="dl-grid">
     ${dlItem("WGT ID", `<span class="mono-cell">${h(asset.wgtCode)}</span>`)}
     ${dlItem("Type", h(Util.typeMeta(asset.type).label))}
-    ${dlItem("Platform", h(asset.platform))}
     ${dlItem("Department", h(asset.department))}
     ${dlItem("Tags", (asset.tags || []).length
       ? (asset.tags).map(t => `<span class="chip tag-chip">${h(t)}</span>`).join(" ") : "—")}
@@ -1277,8 +1279,6 @@ function renderPaneOverview(asset){
     ${dlItem("Last updated", h(Util.formatDateShort(asset.lastUpdated)))}
     ${dlItem("Next review", h(Util.formatDateShort(asset.nextReviewDate)))}
     ${dlItem("Status", renderStatusBadge(asset))}
-    ${dlItem("Access level", h(asset.accessLevel))}
-    ${dlItem("Sensitivity", h(asset.sensitivity))}
   </div>
   ${asset.rejectionReason ? `<div class="warn-banner">${Icon.warn}<span>
     <strong>Rejection note:</strong> ${h(asset.rejectionReason)}</span></div>` : ""}
@@ -1286,40 +1286,8 @@ function renderPaneOverview(asset){
     <h4>Description</h4>
     <p class="body-text">${h(asset.description)}</p>
   </div>
-  <div class="panel-card">
-    <h4>Primary use case</h4>
-    <p class="body-text">${h(asset.useCase)}</p>
-  </div>
   ${asset.problemSolved ? `<div class="panel-card"><h4>What problem does this solve?</h4>
     <p class="body-text">${h(asset.problemSolved)}</p></div>` : ""}`;
-}
-
-function renderPaneHowTo(asset){
-  const c = asset.configuration || {};
-  return `
-  <div class="panel-card"><h4>${Icon.info} What this tool does</h4>
-    <p class="body-text">${h(asset.description)}</p></div>
-  <div class="panel-card"><h4>${Icon.info} When to use it</h4>
-    <p class="body-text">${h(c.whenToUse || asset.useCase)}</p></div>
-  <div class="panel-card"><h4>${Icon.info} What you need to provide</h4>
-    <p class="body-text">${h(asset.inputRequirements || "Not specified.")}</p></div>
-  <div class="panel-card"><h4>${Icon.info} Expected output</h4>
-    <p class="body-text">${h(asset.expectedOutput || "Not specified.")}</p></div>
-  ${asset.exampleUse ? `<div class="panel-card"><h4>${Icon.info} Example use</h4>
-    <div class="example-block">${h(asset.exampleUse)}</div></div>` : ""}
-  ${renderExampleTriggersOrStarters(asset)}`;
-}
-
-function renderExampleTriggersOrStarters(asset){
-  const c = asset.configuration || {};
-  let list = [];
-  if (asset.type === "gpt") list = c.conversationStarters || [];
-  if (asset.type === "skill") list = c.exampleTriggers || [];
-  if (!list.length) return "";
-  return `<div class="panel-card"><h4>${Icon.info} ${
-    asset.type === "gpt" ? "Conversation starters" : "Example trigger prompts"}</h4>
-    ${list.map(p => `<div class="example-block">${h(p)}</div>`).join("")}
-  </div>`;
 }
 
 /** Copy buttons stash the payload in a module-level map keyed by index rather
@@ -1347,32 +1315,18 @@ function renderPaneConfig(asset){
     <div class="panel-card">
       <h4>GPT identity</h4>
       <div class="dl-grid">
-        ${dlItem("GPT name", h(c.gptName || "—"))}
-        ${dlItem("Recommended model", h(c.recommendedModel || "—"))}
+        ${dlItem("Preferred model", h(c.recommendedModel
+          || (CONFIG.noPreferredModelLabel || "No preferred model")))}
       </div>
       <p class="body-text">${h(c.gptDescription || "")}</p>
     </div>
-    ${renderExpandable("instructions", "Instructions", `
+    ${renderExpandable("instructions", "Instructions / Prompt", `
       <div class="copy-row">${copyBtn(c.instructions || "", "Copy instructions")}</div>
       <div class="code-block">${h(c.instructions || "No instructions recorded.")}</div>
     `, true)}
-    ${c.knowledgeBase ? `<div class="panel-card"><h4>Knowledge base</h4>
-      <p class="body-text">${h(c.knowledgeBase)}</p></div>` : ""}
     <div class="panel-card">
-      <h4>Capabilities</h4>
-      <div class="ac-tags">${(c.capabilities || []).map(cap =>
-        `<span class="chip">${Icon.check} ${h(cap)}</span>`).join("")
-        || "<span class='help-text'>None enabled.</span>"}</div>
-    </div>
-    <div class="panel-card">
-      <h4>External integrations</h4>
-      <p class="body-text">Connects to an external app or API:
-        <strong>${h(c.externalIntegration || "No")}</strong></p>
-      ${(c.integrations || []).map(i => `<div class="example-block">
-        <strong>${h(i.name || "Untitled integration")}</strong> — ${h(i.purpose || "")}${
-        i.authNotes ? `<br>Auth notes: ${h(i.authNotes)}` : ""}</div>`).join("")}
-      <div class="warn-banner">${Icon.warn}<span>Never store credentials, API keys,
-        passwords, or access tokens in the Agent Library.</span></div>
+      <h4>Knowledge Base</h4>
+      ${renderAttachedFiles(asset.knowledgeFiles, "No knowledge files attached.")}
     </div>`;
   }
 
@@ -1383,14 +1337,14 @@ function renderPaneConfig(asset){
       ${dlItem("Skill name", h(c.skillName || "—"))}
       <p class="body-text" style="margin-top:8px;">${h(c.skillDescription || "")}</p>
     </div>
-    ${renderExpandable("skillmd", "SKILL.md", `
-      <div class="copy-row">${copyBtn(c.skillMd || "", "Copy SKILL.md")}</div>
-      <div class="code-block">${h(c.skillMd || "No SKILL.md recorded.")}</div>
+    ${renderExpandable("skillinstr", "Instructions / Prompt", `
+      <div class="copy-row">${copyBtn(c.instructions || c.skillMd || "", "Copy instructions")}</div>
+      <div class="code-block">${h(c.instructions || c.skillMd || "No instructions recorded.")}</div>
     `, true)}
-    ${c.instructions && c.instructions !== c.skillMd ? renderExpandable("skillinstr", "Instructions", `
-      <div class="copy-row">${copyBtn(c.instructions, "Copy instructions")}</div>
-      <div class="code-block">${h(c.instructions)}</div>
-    `, false) : ""}
+    <div class="panel-card">
+      <h4>Context</h4>
+      ${renderAttachedFiles(asset.contextFiles, "No context files attached.")}
+    </div>
     <div class="panel-card">
       <h4>Dependencies</h4>
       ${(c.dependencies || []).length
@@ -1422,7 +1376,7 @@ function renderPaneConfig(asset){
       ${c.humanApprovalRequired ? `<p class="body-text" style="margin-top:8px;">
         <strong>Approval point:</strong> ${h(c.approvalLocation || "Not specified")}</p>` : ""}
     </div>
-    ${renderExpandable("sysprompt", "Agent instructions / system prompt", `
+    ${renderExpandable("sysprompt", "Instructions / Prompt", `
       <div class="copy-row">${copyBtn(c.systemPrompt || "", "Copy prompt")}</div>
       <div class="code-block">${h(c.systemPrompt || "No system prompt recorded.")}</div>
     `, true)}
@@ -1439,6 +1393,10 @@ function renderPaneConfig(asset){
         h(t.purpose || "")} <span class="help-text">(${h(t.system || "")})</span></div>`).join("")
         || "<p class='help-text'>None declared.</p>"}
     </div>
+    <div class="panel-card">
+      <h4>Knowledge Base</h4>
+      ${renderAttachedFiles(asset.knowledgeFiles, "No knowledge files attached.")}
+    </div>
     <div class="dl-grid">
       ${dlItem("Knowledge sources", h(c.knowledgeSources || "—"))}
       ${dlItem("Dependencies", h(c.dependencies || "—"))}
@@ -1446,7 +1404,7 @@ function renderPaneConfig(asset){
   }
 
   return `
-  ${renderExpandable("otherinstr", "Instructions", `
+  ${renderExpandable("otherinstr", "Instructions / Prompt", `
     <div class="copy-row">${copyBtn(c.instructions || "", "Copy instructions")}</div>
     <div class="code-block">${h(c.instructions || "No instructions recorded.")}</div>
   `, true)}
@@ -1465,7 +1423,17 @@ function fileKindLabel(kind){
   return (kinds[kind] || {}).label || kind;
 }
 
-function renderFileRow(f, canManage){
+/** Read-only list of attached files, shown under Knowledge Base / Context on
+    the Configuration tab. These are real uploads, so View and Download go to
+    the authorised endpoint rather than the prototype's simulated toast. */
+function renderAttachedFiles(files, emptyLabel){
+  if (!files || !files.length){
+    return `<p class="help-text">${h(emptyLabel)}</p>`;
+  }
+  return files.map(renderFileRow).join("");
+}
+
+function renderFileRow(f){
   const scanFlag = f.scanStatus === "infected"
     ? `<span class="ac-owner-flag">${Icon.warn} Quarantined</span>` : "";
   return `<div class="file-row">
@@ -1480,64 +1448,7 @@ function renderFileRow(f, canManage){
     <span class="file-cat">${h(String(f.ext || "file").toUpperCase())}</span>
     <button class="btn btn-ghost btn-sm" data-view-file="${h(f.id)}">View</button>
     <button class="btn btn-ghost btn-sm" data-download-file="${h(f.id)}">Download</button>
-    ${canManage ? `<button class="btn btn-ghost btn-sm" data-delete-file="${h(f.id)}"
-      aria-label="Delete ${h(f.name)}">${Icon.trash}</button>` : ""}
   </div>`;
-}
-
-function renderPaneFiles(asset){
-  const files = (State.detailFiles && State.detailFiles.files) || asset.files || [];
-  const canUpload = State.detailFiles ? !!State.detailFiles.canUpload : !!asset.canEdit;
-  const kinds = Object.keys((CONFIG && CONFIG.fileKinds) || {});
-  const limits = (CONFIG && CONFIG.limits) || {};
-
-  const groups = kinds.map(kind => {
-    const inKind = files.filter(f => f.kind === kind);
-    if (!inKind.length) return "";
-    return `<div class="panel-card">
-      <h4>${h(fileKindLabel(kind))}</h4>
-      <p class="help-text" style="margin-bottom:10px;">${h((CONFIG.fileKinds[kind] || {}).desc || "")}</p>
-      ${inKind.map(f => renderFileRow(f, canUpload)).join("")}
-    </div>`;
-  }).join("");
-
-  const uploadForm = canUpload ? `
-    <div class="panel-card">
-      <h4>${Icon.upload} Attach a file</h4>
-      <form id="file-upload-form" enctype="multipart/form-data" novalidate>
-        <div class="field-row">
-          <div class="field">
-            <label for="fu-kind">What kind of file is this?</label>
-            <select class="select" id="fu-kind" name="kind">
-              ${kinds.map(k => `<option value="${h(k)}" ${k === "documentation" ? "selected" : ""}>${
-                h(fileKindLabel(k))}</option>`).join("")}
-            </select>
-          </div>
-          <div class="field">
-            <label for="fu-category">Category (optional)</label>
-            <select class="select" id="fu-category" name="category">
-              <option value="">None</option>
-              ${(CONFIG.resourceCategories || []).map(c =>
-                `<option value="${h(c)}">${h(c)}</option>`).join("")}
-            </select>
-          </div>
-        </div>
-        <div class="field">
-          <label for="fu-file">File</label>
-          <input class="input" type="file" id="fu-file" name="file" required>
-          <div class="hint">Allowed: ${h((limits.allowedUploadExtensions || []).join(", "))}.
-            Maximum ${h(Math.round((limits.maxContentLength || 0) / (1024 * 1024)))} MB.</div>
-        </div>
-        <div id="fu-error" class="warn-banner" role="alert"
-             style="display:none;">${Icon.warn}<span></span></div>
-        <button type="submit" class="btn btn-primary" id="fu-submit">Upload file</button>
-      </form>
-      <div class="warn-banner" style="margin-top:12px;">${Icon.warn}<span>Never upload
-        credentials, API keys, or access tokens.</span></div>
-    </div>` : "";
-
-  const body = groups || `<div class="empty-state"><p>No files attached to this asset yet.</p></div>`;
-  return body + uploadForm;
 }
 
 function renderPaneVersions(asset){
@@ -1601,12 +1512,6 @@ function wireDetailEvents(asset){
   panel.querySelectorAll("[data-download-file]").forEach(b =>
     b.onclick = () => { window.location.href = "/api/files/" +
       encodeURIComponent(b.dataset.downloadFile) + "/download"; });
-  panel.querySelectorAll("[data-delete-file]").forEach(b =>
-    b.onclick = () => confirmDeleteFile(Number(b.dataset.deleteFile)));
-
-  const uploadForm = document.getElementById("file-upload-form");
-  if (uploadForm) uploadForm.addEventListener("submit", submitFileUpload);
-
   // Governance actions. Scoped to the panel so the admin table underneath does
   // not get its own buttons re-bound.
   panel.querySelectorAll("[data-approve]").forEach(b =>
@@ -1619,80 +1524,11 @@ function wireDetailEvents(asset){
     b.onclick = () => { const id = Number(b.dataset.editAsset); closeDetail(); startEditAsset(id); });
 }
 
-async function selectDetailTab(tab){
+function selectDetailTab(tab){
   State.detailTab = tab;
-  if (tab === "files" && !State.detailFiles){
-    try {
-      State.detailFiles = await Api.get("/api/assets/" +
-        encodeURIComponent(State.detailAssetId) + "/files");
-    } catch (error){ reportError(error, "Couldn't load the file list."); }
-  }
   renderDetail();
   const active = document.getElementById("tab-" + tab);
   if (active) active.focus();
-}
-
-async function submitFileUpload(event){
-  event.preventDefault();
-  const input = document.getElementById("fu-file");
-  const errorBox = document.getElementById("fu-error");
-  const button = document.getElementById("fu-submit");
-  const showError = (message) => {
-    if (!errorBox) return;
-    errorBox.style.display = "flex";
-    errorBox.querySelector("span").textContent = message;
-  };
-  if (errorBox) errorBox.style.display = "none";
-
-  if (!input || !input.files || !input.files.length){
-    showError("Choose a file first."); return;
-  }
-  const file = input.files[0];
-  const limit = (CONFIG.limits && CONFIG.limits.maxContentLength) || 0;
-  if (limit && file.size > limit){
-    // Fail fast in the browser; the server enforces the same cap regardless.
-    showError("That file is larger than the " +
-      Math.round(limit / (1024 * 1024)) + " MB limit.");
-    return;
-  }
-
-  const body = new FormData();
-  body.append("file", file);
-  body.append("kind", document.getElementById("fu-kind").value);
-  const category = document.getElementById("fu-category").value;
-  if (category) body.append("category", category);
-
-  if (button){ button.disabled = true; button.textContent = "Uploading…"; }
-  try {
-    await Api.upload("/api/assets/" + encodeURIComponent(State.detailAssetId) + "/files", body);
-    State.detailFiles = await Api.get("/api/assets/" +
-      encodeURIComponent(State.detailAssetId) + "/files");
-    Toast.show("File uploaded", "success");
-    renderDetail();
-  } catch (error){
-    const message = error instanceof ApiError
-      ? (Object.values(error.fields)[0] || error.message) : "Upload failed.";
-    showError(message);
-  } finally {
-    if (button){ button.disabled = false; button.textContent = "Upload file"; }
-  }
-}
-
-function confirmDeleteFile(fileId){
-  showModal("Remove file", `<p class="body-text">Remove this file from the asset?
-    It will be deleted from the file store and cannot be recovered.</p>`, [
-    { label:"Cancel", cls:"btn-ghost", onClick: closeModal },
-    { label:"Remove file", cls:"btn-danger", onClick: async () => {
-      try {
-        await Api.del("/api/files/" + encodeURIComponent(fileId));
-        State.detailFiles = await Api.get("/api/assets/" +
-          encodeURIComponent(State.detailAssetId) + "/files");
-        Toast.show("File removed", "info");
-        closeModal();
-        renderDetail();
-      } catch (error){ closeModal(); reportError(error, "Couldn't remove that file."); }
-    }},
-  ]);
 }
 
 /* ---- Add New Version ---------------------------------------------------- */
@@ -1705,7 +1541,7 @@ function openAddVersionModal(asset){
       <div class="field"><label for="nv-summary">Change summary <span class="req">*</span></label>
         <textarea class="textarea" id="nv-summary" placeholder="What changed in this version?"></textarea></div>
       <div class="field"><label for="nv-by">Updated by</label>
-        <input class="input" id="nv-by" value="${h((State.user && State.user.fullName) || asset.owner || "")}"
+        <input class="input" id="nv-by" value="${h(asset.owner || "")}"
                placeholder="Your name"></div>
       <div id="nv-error" class="warn-banner" role="alert" style="display:none;">${Icon.warn}<span></span></div>
       <p class="help-text">This creates a new version entry and preserves the current
@@ -1805,6 +1641,136 @@ function trapFocus(container){
   };
 }
 
+
+/* ---- file dropzone -------------------------------------------------------
+   Drag-and-drop or click-to-browse. Unlike the prototype — which only
+   recorded a filename and said so outright — each file is uploaded for real
+   the moment it is dropped, to POST /api/uploads. The server validates the
+   extension, sniffs the content, scans it if ClamAV is enabled, and stores it
+   privately with no owner yet. The submission then references the returned
+   ids, and the server binds the files to the record it creates.
+
+   Uploading on drop rather than on submit keeps a large attachment from
+   blocking the form, and means a rejected file is reported immediately rather
+   than after the person has filled in everything else. -------------------- */
+function renderRemovableFileRow(f){
+  return `<div class="file-row kb-file-row ${f.uploading ? "is-uploading" : ""}"
+       data-kb-file-row="${h(f.localId || f.id)}">
+    <div class="file-icon">${h(Util.fileIconLabel(f.ext))}</div>
+    <div class="file-meta">
+      <div class="file-name">${h(f.name)}</div>
+      <div class="file-sub">${f.uploading ? "Uploading…" : h(f.size || "—")}</div>
+    </div>
+    ${f.uploading ? "" : `<button type="button" class="btn btn-ghost btn-sm"
+      data-remove-kb-file="${h(f.id)}" aria-label="Remove ${h(f.name)}">Remove</button>`}
+  </div>`;
+}
+
+function renderFileDropzone(files, zoneId, inputId){
+  const limits = (CONFIG && CONFIG.limits) || {};
+  const allowed = (limits.allowedUploadExtensions || []).join(", ");
+  const maxMb = Math.round((limits.maxContentLength || 0) / (1024 * 1024));
+  return `
+  <div class="dropzone" id="${h(zoneId)}" tabindex="0" role="button"
+       aria-label="Add files">
+    <input type="file" id="${h(inputId)}" multiple style="display:none;">
+    ${Icon.file}
+    <p class="dropzone-text">Drag files here, or <span class="dropzone-browse">browse</span></p>
+    <p class="dropzone-hint">Allowed: ${h(allowed)}. Maximum ${h(maxMb)} MB each.</p>
+  </div>
+  <div id="${h(zoneId)}-error" class="warn-banner" role="alert"
+       style="display:none;margin-top:10px;">${Icon.warn}<span></span></div>
+  ${(files || []).length ? `<div class="kb-file-list">${
+    files.map(renderRemovableFileRow).join("")}</div>` : ""}`;
+}
+
+/** Wires a zone rendered by renderFileDropzone().
+
+    `getFiles`/`setFiles` read and write the array this zone owns, so the same
+    component serves the wizard and the update-request form. Re-rendering is
+    left to the caller's `onChange`. */
+function wireFileDropzone(zoneId, inputId, getFiles, setFiles, onChange){
+  const zone = document.getElementById(zoneId);
+  const input = document.getElementById(inputId);
+  if (!zone || !input) return;
+
+  const errorBox = document.getElementById(zoneId + "-error");
+  const showError = (message) => {
+    if (!errorBox) return;
+    errorBox.style.display = "flex";
+    errorBox.querySelector("span").textContent = message;
+  };
+  const clearError = () => { if (errorBox) errorBox.style.display = "none"; };
+
+  const limit = (CONFIG.limits && CONFIG.limits.maxContentLength) || 0;
+
+  async function uploadOne(file){
+    if (limit && file.size > limit){
+      // Fail fast in the browser; the server enforces the same cap regardless.
+      showError('"' + file.name + '" is larger than the ' +
+                Math.round(limit / (1024 * 1024)) + " MB limit.");
+      return;
+    }
+    // Show a placeholder row immediately so a large file looks alive.
+    const localId = "pending-" + Math.random().toString(36).slice(2);
+    setFiles(getFiles().concat([{
+      localId: localId, id: localId, name: file.name,
+      ext: (file.name.split(".").pop() || "other").toLowerCase(),
+      size: Util.formatBytes(file.size), uploading: true,
+    }]));
+    onChange();
+
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const data = await Api.upload("/api/uploads", body);
+      setFiles(getFiles().map(f => (f.localId === localId
+        ? Object.assign({}, data.file, { uploading: false }) : f)));
+    } catch (error){
+      setFiles(getFiles().filter(f => f.localId !== localId));
+      const message = error instanceof ApiError
+        ? (Object.values(error.fields)[0] || error.message) : "Upload failed.";
+      showError('"' + file.name + '" was not accepted: ' + message);
+    }
+    onChange();
+  }
+
+  async function processFiles(fileList){
+    clearError();
+    zone.classList.add("is-busy");
+    for (const file of Array.from(fileList)) await uploadOne(file);
+    const again = document.getElementById(zoneId);
+    if (again) again.classList.remove("is-busy");
+  }
+
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " "){ e.preventDefault(); input.click(); }
+  });
+  input.addEventListener("change", e => { processFiles(e.target.files); input.value = ""; });
+  zone.addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("drag-over"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+  zone.addEventListener("drop", e => {
+    e.preventDefault();
+    zone.classList.remove("drag-over");
+    if (e.dataTransfer && e.dataTransfer.files) processFiles(e.dataTransfer.files);
+  });
+
+  document.querySelectorAll("[data-remove-kb-file]").forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const id = btn.dataset.removeKbFile;
+      setFiles(getFiles().filter(f => String(f.id) !== String(id)));
+      onChange();
+    };
+  });
+}
+
+/** Ids of fully-uploaded files, for the submission payload. */
+function uploadedIds(files){
+  return (files || []).filter(f => !f.uploading).map(f => f.id);
+}
+
 /* ============================================================================
    8. ADD TO LIBRARY — TWO-STEP SUBMISSION FORM
    ----------------------------------------------------------------------------
@@ -1814,21 +1780,24 @@ function trapFocus(container){
    authority — a submission that bypasses this form still gets checked.
    ============================================================================ */
 function newWizardState(){
-  const models = (CONFIG && CONFIG.recommendedModels) || [];
   return {
     step: 1,
     type: null,
     name: "",
     description: "",
     instructions: "",
-    knowledgeBase: "",
-    preferredModel: models[0] || "",
+    // Real uploads, staged on the server before the asset exists. Each entry
+    // is the API's file payload plus a local `uploading` flag.
+    knowledgeFiles: [],   // gpt + agent
+    contextFiles: [],     // skill
+    // Blank means "no preference" — never auto-picked, per v41.
+    preferredModel: "",
     otherPlatform: "",
     link: "",
     department: "",
     tags: [],
-    ownerName: (State.user && State.user.fullName) || "",
-    ownerEmail: (State.user && State.user.email) || "",
+    ownerName: "",
+    ownerEmail: "",
     featured: false,
     _editingAssetId: null,
     _wgtPrefix: "",
@@ -1854,8 +1823,9 @@ async function startEditAsset(assetId){
     w.name = Util.stripWgtPrefix(asset.name);
     w.description = asset.description;
     w.instructions = c.instructions || c.systemPrompt || c.skillMd || "";
-    w.knowledgeBase = c.knowledgeBase || "";
-    w.preferredModel = c.recommendedModel || w.preferredModel;
+    w.knowledgeFiles = (asset.knowledgeFiles || []).slice();
+    w.contextFiles = (asset.contextFiles || []).slice();
+    w.preferredModel = c.recommendedModel || "";
     w.otherPlatform = c.platform || "";
     w.link = asset.directUrl || "";
     w.department = asset.department;
@@ -1903,8 +1873,8 @@ async function renderWizardView(){
       onStep2 ? renderWizStepDetails(w) : renderWizStepType(w)}</div>
     ${onStep2 ? `
     <div class="wizard-foot">
-      ${editing ? `<button class="btn btn-secondary" id="wiz-cancel-edit">Cancel</button>`
-                : `<button class="btn btn-secondary" id="wiz-back">Back</button>`}
+      ${editing ? `<button class="btn btn-secondary" id="wiz-cancel-edit">${Icon.chevLeft} Cancel</button>`
+                : `<button class="btn btn-secondary" id="wiz-back">${Icon.chevLeft} Back</button>`}
       <span class="spacer"></span>
       <button class="btn btn-primary" id="wiz-submit">${
         editing ? "Save Changes" : "Submit for Review"}</button>
@@ -1956,7 +1926,7 @@ function renderWizStepDetails(w){
            placeholder="e.g. n8n, Zapier, an internal PowerApp">
     ${fieldError(w, "otherPlatform")}
   </div>` : ""}
-  ${(editing && isReviewer()) ? `
+  ${(editing && isAdmin()) ? `
   <div class="field featured-field">
     <label class="checkbox-row checkbox-row-lg">
       <input type="checkbox" id="f-featured" class="checkbox-lg" ${w.featured ? "checked" : ""}>
@@ -1965,7 +1935,7 @@ function renderWizStepDetails(w){
   </div>` : ""}
   <div class="field-row">
     <div class="field">
-      <label for="f-owner-name">Creator / Owner Name <span class="req">*</span></label>
+      <label for="f-owner-name">Creator / Owner Full Name <span class="req">*</span></label>
       <input class="input" id="f-owner-name" value="${h(w.ownerName)}" placeholder="Full name">
       ${fieldError(w, "ownerName")}
     </div>
@@ -1998,12 +1968,14 @@ function renderWizStepDetails(w){
   <div class="field">
     <label for="f-name">Name <span class="req">*</span></label>
     ${editing ? "" : `<div class="hint" id="name-field-hint">${w.department
-      ? `Just the name — its WGT code (<strong class="mono-cell">${h(w._wgtPrefix || "…")}</strong>)
-         shows separately, not as part of the name.`
+      ? "Just type the name — the WGT code on the left is added automatically."
       : "Pick a department above first."}</div>`}
-    <input class="input" id="f-name" value="${h(w.name)}"
-           placeholder="${w.department || editing ? "Add a name" : "Pick a department above first"}"
-           ${!editing && !w.department ? "disabled" : ""}>
+    <div class="input-prefix-group ${!editing && !w.department ? "is-disabled" : ""}" id="f-name-group">
+      <span class="input-prefix-chip" id="f-name-prefix">${h(w._wgtPrefix || "WGT")}</span>
+      <input class="input" id="f-name" value="${h(w.name)}"
+             placeholder="${w.department || editing ? "Add a name" : "Pick a department above first"}"
+             ${!editing && !w.department ? "disabled" : ""}>
+    </div>
     ${fieldError(w, "name")}
   </div>
   <div class="field">
@@ -2014,26 +1986,40 @@ function renderWizStepDetails(w){
     ${fieldError(w, "description")}
   </div>
   <div class="field">
-    <label for="f-instructions">Instructions <span class="req">*</span></label>
+    <label for="f-instructions">Instructions / Prompt <span class="req">*</span></label>
     <div class="hint">The prompt / system instructions — this is the main thing that makes it work.</div>
-    <textarea class="textarea code" id="f-instructions" rows="10"
+    <textarea class="textarea code" id="f-instructions" rows="15"
       placeholder="Paste the full prompt or system instructions here...">${h(w.instructions)}</textarea>
     ${fieldError(w, "instructions")}
   </div>
   ${w.type === "gpt" ? `
   <div class="field">
-    <label for="f-knowledge">Knowledge Base</label>
-    <div class="hint">Optional — what files or reference material has this GPT been given, if any?</div>
-    <textarea class="textarea" id="f-knowledge"
-      placeholder="e.g. Prior 6 months of board packs, WGT chart of accounts.">${h(w.knowledgeBase)}</textarea>
+    <label>Knowledge Base</label>
+    <div class="hint">Optional — drop the files this GPT was given as reference material, if any.</div>
+    ${renderFileDropzone(w.knowledgeFiles, "kb-dropzone", "kb-file-input")}
   </div>
   <div class="field">
     <label for="f-model">Preferred Model</label>
-    <div class="hint">Optional — defaults to the org's recommended tier if you're not sure.</div>
+    <div class="hint">Optional — leave this as "No preferred model" unless a specific one actually matters.</div>
     <select class="select" id="f-model">
+      <option value="" ${w.preferredModel === "" ? "selected" : ""}>${
+        h(CONFIG.noPreferredModelLabel || "No preferred model (allow user to decide)")}</option>
       ${(CONFIG.recommendedModels || []).map(m =>
         `<option value="${h(m)}" ${w.preferredModel === m ? "selected" : ""}>${h(m)}</option>`).join("")}
     </select>
+  </div>` : ""}
+  ${w.type === "skill" ? `
+  <div class="field">
+    <label>Context</label>
+    <div class="hint">Optional — drop any files this Skill or Project was given as
+      context or reference material, if any.</div>
+    ${renderFileDropzone(w.contextFiles, "context-dropzone", "context-file-input")}
+  </div>` : ""}
+  ${w.type === "agent" ? `
+  <div class="field">
+    <label>Knowledge Base</label>
+    <div class="hint">Optional — drop the files this Agent was given as reference material, if any.</div>
+    ${renderFileDropzone(w.knowledgeFiles, "kb-dropzone", "kb-file-input")}
   </div>` : ""}
   <div class="field">
     <label for="f-link">Link to the artifact <span class="req">*</span></label>
@@ -2046,7 +2032,7 @@ function renderWizStepDetails(w){
   <div class="field">
     <label id="tag-label">Tags</label>
     <div class="hint">Add up to ${h(maxTags)}, e.g. Accounts Payable, Reporting,
-      Client Onboarding. Press Enter to add.</div>
+      Brazil — include the country if the tool is country-specific. Press Enter to add.</div>
     <div id="tag-input-wrap">${renderTagChips(w)}</div>
     ${fieldError(w, "tags")}
   </div>
@@ -2092,10 +2078,18 @@ function wireWizardStepEvents(){
   }
 
   const on = (id, evt, fn) => { const el = document.getElementById(id); if (el) el.addEventListener(evt, fn); };
+  if (w.type === "gpt" || w.type === "agent"){
+    wireFileDropzone("kb-dropzone", "kb-file-input",
+      () => w.knowledgeFiles, files => { w.knowledgeFiles = files; }, () => render());
+  }
+  if (w.type === "skill"){
+    wireFileDropzone("context-dropzone", "context-file-input",
+      () => w.contextFiles, files => { w.contextFiles = files; }, () => render());
+  }
+
   on("f-name", "input", e => w.name = e.target.value);
   on("f-desc", "input", e => w.description = e.target.value);
   on("f-instructions", "input", e => w.instructions = e.target.value);
-  on("f-knowledge", "input", e => w.knowledgeBase = e.target.value);
   on("f-model", "change", e => w.preferredModel = e.target.value);
   on("f-other-platform", "input", e => w.otherPlatform = e.target.value);
   on("f-link", "input", e => w.link = e.target.value);
@@ -2106,11 +2100,13 @@ function wireWizardStepEvents(){
   on("f-department", "change", async e => {
     w.department = e.target.value;
     const nameField = document.getElementById("f-name");
+    const nameGroup = document.getElementById("f-name-group");
     if (nameField){
       nameField.disabled = !w.department;
       nameField.placeholder = w.department ? "Add a name" : "Pick a department above first";
       if (w.department) nameField.focus();
     }
+    if (nameGroup) nameGroup.classList.toggle("is-disabled", !w.department);
     await refreshWgtPreview();
   });
 
@@ -2129,12 +2125,12 @@ async function refreshWgtPreview(){
   } catch (error){ w._wgtPrefix = ""; }
   const hint = document.getElementById("name-field-hint");
   if (hint){
-    // Built from a constant template plus one escaped value.
-    hint.innerHTML = w.department
-      ? `Just the name — its WGT code (<strong class="mono-cell">${h(w._wgtPrefix || "…")}</strong>)
-         shows separately, not as part of the name.`
+    hint.textContent = w.department
+      ? "Just type the name — the WGT code on the left is added automatically."
       : "Pick a department above first.";
   }
+  const chip = document.getElementById("f-name-prefix");
+  if (chip) chip.textContent = w._wgtPrefix || "WGT";
   const head = document.querySelector(".wiz-step2-head .mono-cell");
   if (head) head.textContent = w._wgtPrefix || "";
 }
@@ -2185,7 +2181,7 @@ function validateWizardForSubmit(w){
     return "Please say what tool this actually is — \"Other\" isn't specific enough on its own.";
   if (!w.link.trim()) return "Link to the artifact is required — that's what people open once this is approved.";
   if (!Util.safeExternalUrl(w.link.trim())) return "The artifact link must be a full http:// or https:// address.";
-  if (!w.ownerName.trim()) return "Creator / Owner Name is required.";
+  if (!w.ownerName.trim()) return "Creator / Owner Full Name is required.";
   if (!w.ownerEmail.trim()) return "Creator / Owner Email is required.";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(w.ownerEmail.trim()))
     return "Creator / Owner Email doesn't look like a valid email address.";
@@ -2199,7 +2195,7 @@ function wireWizardNav(){
   const backBtn = document.getElementById("wiz-back"); if (backBtn) backBtn.onclick = goBack;
   const backTop = document.getElementById("wiz-back-top"); if (backTop) backTop.onclick = goBack;
   const cancel = () => { const editing = !!w._editingAssetId; State.wizard = null;
-    setView(editing && isReviewer() ? "admin" : "my"); };
+    setView(editing ? "admin" : "library"); };
   const cancelBtn = document.getElementById("wiz-cancel-edit"); if (cancelBtn) cancelBtn.onclick = cancel;
   const cancelTop = document.getElementById("wiz-cancel-edit-top"); if (cancelTop) cancelTop.onclick = cancel;
   const submit = document.getElementById("wiz-submit");
@@ -2213,8 +2209,10 @@ function wizardPayload(w){
     name: w.name.trim(),
     description: w.description.trim(),
     instructions: w.instructions,
-    knowledgeBase: w.knowledgeBase,
     preferredModel: w.preferredModel,
+    knowledgeFileIds: (w.type === "gpt" || w.type === "agent")
+      ? uploadedIds(w.knowledgeFiles) : undefined,
+    contextFileIds: w.type === "skill" ? uploadedIds(w.contextFiles) : undefined,
     otherPlatform: w.otherPlatform.trim(),
     link: w.link.trim(),
     ownerName: w.ownerName.trim(),
@@ -2284,8 +2282,8 @@ async function submitNewAsset(w){
     const data = await Api.post("/api/assets", wizardPayload(w));
     State.wizard = null;
     Toast.show("Submitted for review — your reference is " + data.asset.wgtCode, "success");
-    await refreshPendingCount();
-    setView("my");
+    await refreshAdminCounts();
+    setView("library");
   } catch (error){
     w._submitting = false;
     if (!applyServerFieldErrors(error)) reportError(error, "Couldn't submit that asset.");
@@ -2306,10 +2304,9 @@ async function finalizeEditAsset(){
   if (button){ button.disabled = true; button.textContent = "Saving…"; }
   try {
     const data = await Api.put("/api/assets/" + encodeURIComponent(w._editingAssetId), wizardPayload(w));
-    const wasReviewer = isReviewer();
     State.wizard = null;
     Toast.show(Util.stripWgtPrefix(data.asset.name) + " updated", "success");
-    setView(wasReviewer ? "admin" : "my");
+    setView("admin");
   } catch (error){
     w._submitting = false;
     if (!applyServerFieldErrors(error)) reportError(error, "Couldn't save those changes.");
@@ -2320,118 +2317,395 @@ async function finalizeEditAsset(){
 }
 
 /* ============================================================================
-   9. MY SUBMISSIONS
-   The prototype only mentioned this view in a comment — it was never built.
-   It is backed by GET /api/my-submissions, which scopes rows to the signed-in
-   user on the server; there is no client-side filtering to bypass.
+   9. UPDATE AN AGENT
+   ----------------------------------------------------------------------------
+   Anyone can flag that a published tool has changed. This never touches the
+   live record: it collects the proposed new values into an update request
+   that an admin reads and accepts or declines. Which fields are on offer
+   depends on the asset's type, and the list comes from the server so the
+   client cannot invent one.
    ============================================================================ */
-async function renderMySubmissionsView(){
-  const data = await Api.get("/api/my-submissions", { q: State.my.query.trim() });
-  State.my.result = data;
+function resetUpdateForm(){
+  State.update = {
+    searchQuery: "", assetId: "", asset: null,
+    fields: [], proposed: {},
+    files: { knowledgeFiles: [], contextFiles: [] },
+    notes: "", requesterName: "", requesterEmail: "", submitting: false,
+  };
+}
 
-  const order = ["Pending Review", "Approved", "Rejected", "Deprecated", "Archived"];
-  const buckets = data.buckets || {};
+/** Field ids whose value is a file list rather than text. */
+const UPDATE_FILE_FIELDS = { knowledgeBase: "knowledgeFiles", context: "contextFiles" };
 
-  const bucketHtml = order.map(status => {
-    const items = buckets[status] || [];
-    if (!items.length) return "";
-    return `
-    <div class="admin-section">
-      <div class="admin-section-head">
-        <h2>${h(status)}</h2>
-        <span class="help-text">${h(items.length)} asset${items.length === 1 ? "" : "s"}</span>
-      </div>
-      <div class="table-wrap"><table class="data-table">
-        <caption class="sr-only">${h(status)} submissions</caption>
-        <thead><tr><th scope="col">WGT ID</th><th scope="col">Asset Name</th>
-          <th scope="col">Type</th><th scope="col">Department</th>
-          <th scope="col">Updated</th><th scope="col">Version</th>
-          <th scope="col">Actions</th></tr></thead>
-        <tbody>
-          ${items.map(a => `
-          <tr>
-            <td class="mono-cell">${h(a.wgtCode)}</td>
-            <td><span class="row-name" data-open-detail="${h(a.id)}" tabindex="0" role="button">${
-              h(Util.stripWgtPrefix(a.name))}</span></td>
-            <td>${h(Util.typeMeta(a.type).label)}</td>
-            <td>${h(a.department)}</td>
-            <td>${h(Util.formatDateShort(a.lastUpdated))}</td>
-            <td>v${h(a.currentVersion)}</td>
-            <td class="table-actions">
-              <button class="btn btn-ghost btn-sm" data-open-detail="${h(a.id)}">View</button>
-              ${a.canEdit ? `<button class="btn btn-secondary btn-sm" data-edit-asset="${h(a.id)}">Edit</button>` : ""}
-            </td>
-          </tr>`).join("")}
-        </tbody>
-      </table></div>
-    </div>`;
-  }).join("");
+function updateFieldOptions(assetType){
+  const byType = (CONFIG.updateRequestFieldsByType || {})[assetType];
+  return byType || [];
+}
+
+async function renderUpdateRequestView(){
+  const u = State.update;
+
+  // Pull the published catalogue once; the picker searches it in place, the
+  // same as the prototype's client-side filter over approved assets.
+  const data = await Api.get("/api/assets", {
+    status: "Approved", per_page: (CONFIG.limits && CONFIG.limits.maxPageSize) || 200,
+    sort: "name",
+  });
+  const approved = data.items || [];
+
+  // If the picked asset vanished (archived while the form sat open), fall
+  // back to the picker rather than showing a stale form.
+  if (u.assetId && !approved.some(a => String(a.id) === String(u.assetId))){
+    u.assetId = ""; u.asset = null; u.fields = []; u.proposed = {};
+  }
 
   document.getElementById("view-root").innerHTML = `
   <div class="page-head">
-    <h1>My Submissions</h1>
-    <p class="sub">Everything you've submitted or own, grouped by where it is in the
-      review process.</p>
+    <h1>Update an Agent</h1>
+    <p class="sub">Flag a change for something already published. An admin reviews
+      what you send and applies it — this doesn't update the Library entry itself
+      until then.</p>
   </div>
-  <div class="search-bar">
-    ${Icon.search}
-    <input type="text" id="my-search" placeholder="Search your submissions..."
-           value="${h(State.my.query)}" aria-label="Search your submissions">
-  </div>
-  <div class="toolbar-row">
-    <span class="result-count">${h(data.total)} submission${data.total === 1 ? "" : "s"}</span>
-  </div>
-  ${bucketHtml || `<div class="empty-state">
-    <div class="em-icon">${Icon.addSquare}</div>
-    <h3>You haven't submitted anything yet</h3>
-    <p>Register a GPT, Claude Skill, Copilot Agent, or any other automation you've built.</p>
-    <button class="btn btn-primary" id="my-empty-add">Add to Library</button>
-    <div class="empty-note">nothing here yet — but that's easy to fix ✈</div>
-  </div>`}`;
+  <div class="wizard-shell">
+    <div class="wizard-body" id="update-step-body">
+      ${renderUpdateAssetPicker(u, approved)}
+      ${u.asset ? renderUpdateChangesSection(u) : ""}
+    </div>
+    ${u.asset ? `
+    <div class="wizard-foot">
+      <span class="spacer"></span>
+      <button class="btn btn-primary" id="ur-submit">Submit Update Request</button>
+    </div>` : ""}
+  </div>`;
 
-  const search = document.getElementById("my-search");
-  if (search){
-    search.addEventListener("input", Util.debounce(async e => {
-      State.my.query = e.target.value;
-      await render();
-      const again = document.getElementById("my-search");
-      if (again){ again.focus(); again.selectionStart = again.selectionEnd = again.value.length; }
-    }, 220));
+  wireUpdateRequestEvents(approved);
+}
+
+function renderUpdateAssetPicker(u, approved){
+  if (u.asset){
+    return `
+    <div class="field">
+      <label>Tool to update</label>
+      <div class="picked-asset-row">
+        <span class="mono-cell">${h(u.asset.wgtCode)}</span>
+        <span class="picked-asset-name">${h(Util.stripWgtPrefix(u.asset.name))}</span>
+        <button type="button" class="btn btn-ghost btn-sm" id="ur-change-asset">Change</button>
+      </div>
+    </div>`;
   }
-  const emptyAdd = document.getElementById("my-empty-add");
-  if (emptyAdd) emptyAdd.onclick = startNewSubmission;
-  document.querySelectorAll("[data-edit-asset]").forEach(b =>
-    b.onclick = () => startEditAsset(Number(b.dataset.editAsset)));
-  wireOpenHandlers(document);
+
+  const q = u.searchQuery.trim().toLowerCase();
+  const results = q
+    ? approved.filter(a => (a.wgtCode || "").toLowerCase().includes(q) ||
+        Util.stripWgtPrefix(a.name).toLowerCase().includes(q))
+    : approved;
+
+  return `
+  <div class="field">
+    <label for="ur-search">Which tool needs updating? <span class="req">*</span></label>
+    <div class="hint">Browse the full list below, or type to narrow it down by name
+      or WGT code — then click the one you mean.</div>
+    <input class="input" id="ur-search" placeholder="e.g. WGT201 or Financial Commentary"
+           value="${h(u.searchQuery)}" autocomplete="off">
+    ${approved.length ? `
+    <div class="search-result-list">
+      <div class="help-text" style="padding:8px 12px;border-bottom:1px solid var(--border-subtle);">${
+        q ? `${h(results.length)} match${results.length === 1 ? "" : "es"} for "${h(u.searchQuery.trim())}"`
+          : `Showing all ${h(approved.length)} published tool${approved.length === 1 ? "" : "s"}`}</div>
+      ${results.length
+        ? results.slice(0, 50).map(a => `
+          <div class="search-result-row" data-pick-asset="${h(a.id)}" tabindex="0" role="button">
+            <span class="mono-cell">${h(a.wgtCode)}</span>
+            <span>${h(Util.stripWgtPrefix(a.name))}</span>
+          </div>`).join("")
+        : `<div class="help-text" style="padding:10px 2px;">No matches — try a different search.</div>`}
+    </div>` : `<div class="hint">Nothing's published yet — there's nothing to
+      request an update for.</div>`}
+  </div>`;
+}
+
+function renderUpdateChangesSection(u){
+  const options = updateFieldOptions(u.asset.type);
+  return `
+  <div class="field">
+    <label>What's changed? <span class="req">*</span></label>
+    <div class="hint">Select everything that needs updating — you'll be asked for
+      the new value for each one.</div>
+    ${options.map(f => `
+      <label class="checkbox-row" style="margin-bottom:8px;">
+        <input type="checkbox" data-update-field="${h(f.id)}"
+               ${u.fields.includes(f.id) ? "checked" : ""}>
+        ${h(f.label)}
+      </label>`).join("")}
+  </div>
+  ${u.fields.map(fid => {
+    const meta = options.find(f => f.id === fid);
+    return meta ? renderUpdateFieldInput(meta, u) : "";
+  }).join("")}
+  <div class="field">
+    <label for="ur-notes">Anything else the reviewer should know?</label>
+    <textarea class="textarea" id="ur-notes"
+      placeholder="Optional context for whoever reviews this.">${h(u.notes)}</textarea>
+  </div>
+  <div class="field-row">
+    <div class="field"><label for="ur-requester-name">Your Full Name <span class="req">*</span></label>
+      <input class="input" id="ur-requester-name" value="${h(u.requesterName)}"></div>
+    <div class="field"><label for="ur-requester-email">Your Email <span class="req">*</span></label>
+      <input class="input" type="email" id="ur-requester-email" value="${h(u.requesterEmail)}"
+             placeholder="name@wingsglobaltravel.com"></div>
+  </div>
+  <div class="warn-banner">${Icon.warn}<span>Never paste credentials, API keys, or
+    passwords into any field here.</span></div>`;
+}
+
+function renderUpdateFieldInput(meta, u){
+  if (meta.kind === "owner"){
+    return `
+    <div class="field-row">
+      <div class="field"><label>New Owner's Full Name</label>
+        <input class="input" data-update-value="ownerName"
+               value="${h(u.proposed.ownerName || "")}"></div>
+      <div class="field"><label>New Owner Email</label>
+        <input class="input" type="email" data-update-value="ownerEmail"
+               value="${h(u.proposed.ownerEmail || "")}"></div>
+    </div>`;
+  }
+
+  const value = u.proposed[meta.id] || "";
+
+  if (meta.id === "name"){
+    // Same inline WGT chip as the main Name field, so nobody retypes the code.
+    return `
+    <div class="field">
+      <label>${h(meta.promptLabel)}</label>
+      <div class="input-prefix-group">
+        <span class="input-prefix-chip">${h(u.asset.wgtCode)}</span>
+        <input class="input" data-update-value="name" value="${h(value)}"
+               placeholder="New name for this tool">
+      </div>
+    </div>`;
+  }
+
+  if (meta.kind === "select"){
+    const labels = meta.optionLabels || {};
+    return `
+    <div class="field">
+      <label>${h(meta.promptLabel)}</label>
+      <select class="select" data-update-value="${h(meta.id)}">
+        ${(meta.options || []).map(o => `<option value="${h(o)}" ${
+          value === o ? "selected" : ""}>${h(labels[o] || o)}</option>`).join("")}
+      </select>
+    </div>`;
+  }
+
+  if (meta.kind === "files"){
+    const key = meta.filesKey || (meta.id + "Files");
+    return `
+    <div class="field">
+      <label>${h(meta.promptLabel)}</label>
+      ${renderFileDropzone(u.files[key] || [], "dropzone-ur-" + meta.id,
+                           "dropzone-input-ur-" + meta.id)}
+    </div>`;
+  }
+
+  if (meta.kind === "textarea"){
+    return `
+    <div class="field">
+      <label>${h(meta.promptLabel)}</label>
+      ${meta.hint ? `<div class="hint">${h(meta.hint)}</div>` : ""}
+      <textarea class="textarea" data-update-value="${h(meta.id)}"
+        placeholder="${h(meta.placeholder || "")}">${h(value)}</textarea>
+    </div>`;
+  }
+
+  return `
+  <div class="field">
+    <label>${h(meta.promptLabel)}</label>
+    ${meta.hint ? `<div class="hint">${h(meta.hint)}</div>` : ""}
+    <input class="input" data-update-value="${h(meta.id)}" value="${h(value)}"
+           placeholder="${h(meta.placeholder || "")}">
+  </div>`;
+}
+
+function wireUpdateRequestEvents(approved){
+  const u = State.update;
+
+  const searchInput = document.getElementById("ur-search");
+  if (searchInput){
+    searchInput.addEventListener("input", Util.debounce(async e => {
+      u.searchQuery = e.target.value;
+      await render();
+      const again = document.getElementById("ur-search");
+      if (again){ again.focus(); again.selectionStart = again.selectionEnd = again.value.length; }
+    }, 160));
+  }
+
+  document.querySelectorAll("[data-pick-asset]").forEach(row => {
+    const choose = () => {
+      const picked = approved.find(a => String(a.id) === String(row.dataset.pickAsset));
+      if (!picked) return;
+      u.assetId = picked.id;
+      u.asset = picked;
+      u.fields = []; u.proposed = {};
+      u.files = { knowledgeFiles: [], contextFiles: [] };
+      render();
+    };
+    row.addEventListener("click", choose);
+    row.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " "){ e.preventDefault(); choose(); }
+    });
+  });
+
+  const changeBtn = document.getElementById("ur-change-asset");
+  if (changeBtn) changeBtn.onclick = () => {
+    u.assetId = ""; u.asset = null; u.fields = []; u.proposed = {};
+    u.files = { knowledgeFiles: [], contextFiles: [] };
+    u.searchQuery = "";
+    render();
+  };
+
+  if (!u.asset) return;   // nothing else on the page until a tool is picked
+
+  document.querySelectorAll("[data-update-field]").forEach(cb => {
+    cb.onchange = e => {
+      const fid = cb.dataset.updateField;
+      if (e.target.checked){ if (!u.fields.includes(fid)) u.fields.push(fid); }
+      else { u.fields = u.fields.filter(f => f !== fid); }
+      render();
+    };
+  });
+
+  document.querySelectorAll("[data-update-value]").forEach(el => {
+    const eventName = el.tagName === "SELECT" ? "change" : "input";
+    el.addEventListener(eventName, e => { u.proposed[el.dataset.updateValue] = e.target.value; });
+  });
+
+  // File dropzones for whichever file fields are ticked.
+  Object.keys(UPDATE_FILE_FIELDS).forEach(fid => {
+    if (!u.fields.includes(fid)) return;
+    const key = UPDATE_FILE_FIELDS[fid];
+    u.files[key] = u.files[key] || [];
+    wireFileDropzone("dropzone-ur-" + fid, "dropzone-input-ur-" + fid,
+      () => u.files[key], files => { u.files[key] = files; }, () => render());
+  });
+
+  const notes = document.getElementById("ur-notes");
+  if (notes) notes.oninput = e => u.notes = e.target.value;
+  const name = document.getElementById("ur-requester-name");
+  if (name) name.oninput = e => u.requesterName = e.target.value;
+  const email = document.getElementById("ur-requester-email");
+  if (email) email.oninput = e => u.requesterEmail = e.target.value;
+
+  const submit = document.getElementById("ur-submit");
+  if (submit) submit.onclick = finalizeUpdateRequest;
+}
+
+/** Fast client-side feedback. The server re-validates all of this. */
+function validateUpdateRequest(u){
+  if (!u.assetId) return "Pick the tool that needs updating.";
+  if (!u.fields.length) return "Select at least one thing that changed.";
+  const options = updateFieldOptions(u.asset.type);
+  for (const fid of u.fields){
+    const meta = options.find(f => f.id === fid) || {};
+    const label = meta.label || fid;
+    if (meta.kind === "owner"){
+      if (!(u.proposed.ownerName || "").trim() && !(u.proposed.ownerEmail || "").trim()){
+        return 'Provide the new owner name or email, or unselect "' + label + '".';
+      }
+      continue;
+    }
+    if (meta.kind === "files"){
+      const key = meta.filesKey || (fid + "Files");
+      if (!uploadedIds(u.files[key]).length){
+        return 'Add at least one file for "' + label + '", or unselect it.';
+      }
+      continue;
+    }
+    if (!(u.proposed[fid] || "").trim()){
+      return 'Provide the new value for "' + label + '", or unselect it.';
+    }
+  }
+  if (!u.requesterName.trim()) return "Your full name is required.";
+  if (!u.requesterEmail.trim()) return "Your email is required.";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(u.requesterEmail.trim()))
+    return "Your email doesn't look like a valid email address.";
+  return null;
+}
+
+async function finalizeUpdateRequest(){
+  const u = State.update;
+  const err = validateUpdateRequest(u);
+  if (err){ Toast.show(err, "error"); return; }
+  if (u.submitting) return;
+  u.submitting = true;
+
+  const button = document.getElementById("ur-submit");
+  if (button){ button.disabled = true; button.textContent = "Submitting…"; }
+  try {
+    const payload = {
+      assetId: u.assetId,
+      fields: u.fields.slice(),
+      proposed: Object.assign({}, u.proposed),
+      notes: u.notes.trim(),
+      requesterName: u.requesterName.trim(),
+      requesterEmail: u.requesterEmail.trim(),
+    };
+    if (u.fields.includes("knowledgeBase")){
+      payload.knowledgeFileIds = uploadedIds(u.files.knowledgeFiles);
+    }
+    if (u.fields.includes("context")){
+      payload.contextFileIds = uploadedIds(u.files.contextFiles);
+    }
+    const data = await Api.post("/api/update-requests", payload);
+    const code = data.updateRequest.wgtCode;
+    resetUpdateForm();
+    Toast.show("Update request submitted for " + code + " — an admin will review it.",
+               "success");
+    setView("library");
+  } catch (error){
+    u.submitting = false;
+    const message = error instanceof ApiError
+      ? (Object.values(error.fields)[0] || error.message)
+      : "Couldn't submit that request.";
+    Toast.show(message, "error");
+  } finally {
+    if (button){ button.disabled = false; button.textContent = "Submit Update Request"; }
+    if (State.update) State.update.submitting = false;
+  }
 }
 
 /* ============================================================================
    10. ADMIN / REVIEW
    ============================================================================ */
 async function renderAdminView(){
-  if (!isReviewer()){
+  if (!isAdmin()){
     document.getElementById("view-root").innerHTML = `
-      <div class="empty-state"><h3>Reviewer access required</h3>
-      <p>Sign in with a reviewer or administrator account to view the review queue.</p>
-      <button class="btn btn-primary" id="admin-signin">Sign in</button></div>`;
-    const btn = document.getElementById("admin-signin");
-    if (btn) btn.onclick = () => openLoginModal(() => setView("admin"));
+      <div class="empty-state"><h3>Admin access required</h3>
+      <p>Enter the admin password to view the review queue.</p>
+      <button class="btn btn-primary" id="admin-unlock">Enter password</button></div>`;
+    const btn = document.getElementById("admin-unlock");
+    if (btn) btn.onclick = () => promptUnlock(() => setView("admin"));
     return;
   }
 
   const tab = State.admin.tab;
-  const [stats, pending] = await Promise.all([
+  const [stats, pending, updates] = await Promise.all([
     Api.get("/api/admin/stats"),
     Api.get("/api/assets", { status: "Pending Review", per_page: 100, sort: "created_at" }),
+    Api.get("/api/update-requests", { status: "Open", per_page: 100 }),
   ]);
   State.admin.stats = stats;
   State.admin.pending = pending;
-  _pendingCount = pending.total || 0;
+  State.admin.updates = updates;
+  _pendingCount = (pending.total || 0) + (updates.openCount || 0);
 
+  // v41 lists every published asset by default rather than only on search.
   let manage = { items: [], total: 0 };
   const query = State.admin.librarySearch.trim();
-  if (tab === "manage" && query){
-    manage = await Api.get("/api/assets", { status: "Approved", q: query, per_page: 50 });
+  if (tab === "manage"){
+    manage = await Api.get("/api/assets", {
+      status: "Approved", q: query, per_page: 200, sort: "name",
+    });
   }
   State.admin.manage = manage;
 
@@ -2454,8 +2728,9 @@ async function renderAdminView(){
       <div class="kpi-label">Pending review</div></div>
     <div class="kpi-card"><div class="kpi-num">${h(stats.statusCounts["Approved"] || 0)}</div>
       <div class="kpi-label">Live in the Library</div></div>
-    <div class="kpi-card ${stats.reviewDue ? "warn" : ""}"><div class="kpi-num">${h(stats.reviewDue)}</div>
-      <div class="kpi-label">Review date passed</div></div>
+    <div class="kpi-card ${stats.openUpdateRequests ? "warn" : ""}">
+      <div class="kpi-num">${h(stats.openUpdateRequests)}</div>
+      <div class="kpi-label">Open update requests</div></div>
     <div class="kpi-card ${stats.missingOwner ? "warn" : ""}"><div class="kpi-num">${h(stats.missingOwner)}</div>
       <div class="kpi-label">Missing an owner</div></div>
     <div class="kpi-card"><div class="kpi-num">${h(stats.totalFiles)}</div>
@@ -2468,13 +2743,13 @@ async function renderAdminView(){
         aria-selected="${tab === id}" data-admin-tab="${h(id)}">${h(label)}</button>`).join("")}
   </div>
 
-  ${tab === "pending" ? renderAdminPending(pending) : ""}
+  ${tab === "pending" ? renderAdminPending(pending) + renderAdminUpdates(updates) : ""}
   ${tab === "manage" ? renderAdminManage(manage, query) : ""}
   ${tab === "activity" ? renderAdminActivity(activity) : ""}
 
-  ${isAdmin() ? `<div class="admin-footer-actions">
-    <button class="btn btn-secondary btn-sm" id="open-change-password">Change my password</button>
-  </div>` : ""}`;
+  <div class="admin-footer-actions">
+    <button class="btn btn-secondary btn-sm" id="open-change-password">Change Admin Password</button>
+  </div>`;
 
   wireAdminEvents();
 }
@@ -2513,14 +2788,131 @@ function renderAdminPending(pending){
   </div>`;
 }
 
+
+function renderAdminUpdates(updates){
+  const rows = updates.items || [];
+  return `
+  <div class="admin-section">
+    <div class="admin-section-head"><h2>Update Requests</h2>
+      <span class="help-text">${h(updates.openCount || 0)} awaiting review</span></div>
+    <div class="hint" style="margin-bottom:10px;">Submitted via Update an Agent —
+      review the proposed content, then accept to apply it to the asset, or decline
+      to close it without changing anything.</div>
+    <div class="table-wrap"><table class="data-table">
+      <caption class="sr-only">Open update requests</caption>
+      <thead><tr><th scope="col">WGT ID</th><th scope="col">Tool</th>
+        <th scope="col">What changed</th><th scope="col">Requested By</th>
+        <th scope="col">Submitted</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+        ${rows.length ? rows.map(r => `
+          <tr>
+            <td class="mono-cell">${h(r.wgtCode)}</td>
+            <td>${h(Util.stripWgtPrefix(r.assetName))}</td>
+            <td>${(r.fieldLabels || []).map(l =>
+              `<span class="chip tag-chip">${h(l)}</span>`).join(" ")}</td>
+            <td>${h(r.requesterName || "—")}<div class="row-sub">${
+              h(r.requesterEmail || "—")}</div></td>
+            <td>${h(Util.formatDateShort(r.submittedDate))}</td>
+            <td class="table-actions">
+              <button class="btn btn-ghost btn-sm" data-review-update="${h(r.id)}">Review</button>
+            </td>
+          </tr>`).join("")
+          : `<tr><td colspan="6" class="help-text">No open update requests.</td></tr>`}
+      </tbody>
+    </table></div>
+  </div>`;
+}
+
+/** The review modal: shows exactly what was proposed, warns when the requester
+    is not the owner on record, and offers Accept / Decline. */
+async function openReviewUpdateModal(id){
+  let record;
+  try {
+    const data = await Api.get("/api/update-requests/" + encodeURIComponent(id));
+    record = data.updateRequest;
+  } catch (error){ reportError(error, "Couldn't load that update request."); return; }
+
+  const labels = (CONFIG.updateRequestFieldLabels) || {};
+  const label = (fid) => labels[fid] || fid;
+
+  const mismatchBanner = record.ownerMismatch ? `
+    <div class="warn-banner">${Icon.warn}<span>This request was submitted by
+      <strong>${h(record.requesterName || "—")}</strong> (${h(record.requesterEmail || "—")}),
+      which doesn't match this asset's Creator / Owner on record —
+      <strong>${h(record.assetOwner || "—")}</strong> (${h(record.assetOwnerEmail || "—")}).
+      Worth confirming this is legitimate before accepting.</span></div>` : "";
+
+  const fieldRows = (record.fields || []).map(fid => {
+    if (fid === "owner"){
+      return `
+        <div class="field"><label>New Owner's Full Name</label>
+          <p class="body-text">${h(record.proposed.ownerName || "—")}</p></div>
+        <div class="field"><label>New Owner Email</label>
+          <p class="body-text">${h(record.proposed.ownerEmail || "—")}</p></div>`;
+    }
+    if (fid === "knowledgeBase" || fid === "context"){
+      const key = fid === "context" ? "contextFiles" : "knowledgeFiles";
+      const files = (record.files && record.files[key]) || [];
+      return `<div class="field"><label>${h(label(fid))}</label>
+        ${files.length ? files.map(renderFileRow).join("")
+                       : `<p class="body-text">—</p>`}</div>`;
+    }
+    if (fid === "preferredModel"){
+      return `<div class="field"><label>${h(label(fid))}</label>
+        <p class="body-text">${h(record.proposed.preferredModel
+          || (CONFIG.noPreferredModelLabel || "No preferred model"))}</p></div>`;
+    }
+    return `<div class="field"><label>${h(label(fid))}</label>
+      <p class="body-text" style="white-space:pre-wrap;">${
+        h(record.proposed[fid] || "—")}</p></div>`;
+  }).join("");
+
+  showModal("Update Request — " + record.wgtCode, `
+    <p class="body-text" style="margin-bottom:16px;">Requested by
+      <strong>${h(record.requesterName || "—")}</strong> (${h(record.requesterEmail || "—")})
+      on ${h(Util.formatDateShort(record.submittedDate))} for
+      "${h(Util.stripWgtPrefix(record.assetName))}"${
+        record.assetExists ? "" : " — this asset no longer exists in the Library."}</p>
+    ${mismatchBanner}
+    ${record.notes ? `<div class="field"><label>Notes from requester</label>
+      <p class="body-text">${h(record.notes)}</p></div>` : ""}
+    ${fieldRows}
+  `, [
+    { label:"Cancel", cls:"btn-ghost", onClick: closeModal },
+    { label:"Decline Changes", cls:"btn-danger-ghost",
+      onClick: () => resolveUpdateRequest(record.id, "decline") },
+    { label:"Accept Changes", cls:"btn-primary",
+      onClick: () => resolveUpdateRequest(record.id, "accept") },
+  ]);
+}
+
+async function resolveUpdateRequest(id, action){
+  try {
+    const data = await Api.post("/api/update-requests/" + encodeURIComponent(id) +
+                                "/" + action);
+    closeModal();
+    if (action === "accept"){
+      Toast.show(Util.stripWgtPrefix(data.asset.name) + " updated — changes applied.",
+                 "success");
+    } else {
+      Toast.show("Update request declined — no changes were made.", "info");
+    }
+    await refreshAdminCounts();
+    render();
+  } catch (error){
+    closeModal();
+    reportError(error, "Couldn't resolve that update request.");
+  }
+}
+
 function renderAdminManage(manage, query){
   const rows = manage.items || [];
   return `
   <div class="admin-section">
     <div class="admin-section-head"><h2>Manage Library</h2>
       <span class="help-text">${h(State.admin.stats.statusCounts["Approved"] || 0)} live in the Library</span></div>
-    <div class="hint" style="margin-bottom:10px;">Search by WGT ID or name to find a
-      published asset and take it down.</div>
+    <div class="hint" style="margin-bottom:10px;">Every published asset is listed
+      below — search by WGT ID or name to narrow it down.</div>
     <label class="sr-only" for="admin-library-search">Search published assets</label>
     <input class="input" id="admin-library-search" placeholder="e.g. WGT201 or Financial Commentary"
            value="${h(State.admin.librarySearch)}" style="max-width:360px;margin-bottom:14px;">
@@ -2545,7 +2937,7 @@ function renderAdminManage(manage, query){
           </tr>`).join("")
           : `<tr><td colspan="6" class="help-text">${query
               ? "No published assets match that search."
-              : "Type a WGT ID or name above to find a published asset."}</td></tr>`}
+              : "Nothing's published yet."}</td></tr>`}
       </tbody>
     </table></div>
   </div>`;
@@ -2589,6 +2981,9 @@ function summariseDetail(detail){
 }
 
 function wireAdminEvents(){
+  document.querySelectorAll("[data-review-update]").forEach(b =>
+    b.onclick = () => openReviewUpdateModal(Number(b.dataset.reviewUpdate)));
+
   document.querySelectorAll("[data-admin-tab]").forEach(b => b.onclick = () => {
     State.admin.tab = b.dataset.adminTab; render();
   });
@@ -2625,7 +3020,7 @@ async function approveAsset(id, onDone){
   try {
     const data = await Api.post("/api/assets/" + encodeURIComponent(id) + "/approve");
     Toast.show(Util.stripWgtPrefix(data.asset.name) + " approved and published", "success");
-    await refreshPendingCount();
+    await refreshAdminCounts();
     if (typeof onDone === "function") onDone();
   } catch (error){ reportError(error, "Approve failed."); }
 }
@@ -2647,7 +3042,7 @@ function rejectAssetWithConfirm(id, onDone){
         const data = await Api.post("/api/assets/" + encodeURIComponent(id) + "/reject",
           { reason: reason.trim() });
         Toast.show(Util.stripWgtPrefix(data.asset.name) + " rejected", "info");
-        await refreshPendingCount();
+        await refreshAdminCounts();
       } catch (error){ reportError(error, "Reject failed."); }
       finally { closeModal(); if (typeof onDone === "function") onDone(); }
     }},
@@ -2681,10 +3076,7 @@ function removeFromLibraryWithConfirm(id, onDone){
    ============================================================================ */
 function wireGlobalChrome(){
   const addBtn = document.getElementById("topbar-add-btn");
-  if (addBtn) addBtn.addEventListener("click", () => {
-    if (!isAuthenticated()){ openLoginModal(startNewSubmission); return; }
-    startNewSubmission();
-  });
+  if (addBtn) addBtn.addEventListener("click", startNewSubmission);
 
   document.getElementById("detail-overlay").addEventListener("click", e => {
     if (e.target.id === "detail-overlay") closeDetail();
@@ -2752,7 +3144,6 @@ async function initApp(){
 
   await refreshSession();
   renderSidebarNav();
-  renderTopbarActions();
   wireGlobalChrome();
 
   window.addEventListener("hashchange", () => {
@@ -2761,7 +3152,7 @@ async function initApp(){
   });
 
   applyViewFromHash();
-  refreshPendingCount();
+  refreshAdminCounts();
 }
 
 document.addEventListener("DOMContentLoaded", initApp);

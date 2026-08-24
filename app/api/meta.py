@@ -41,6 +41,12 @@ def get_config():
         "requireLoginToBrowse": bool(current_app.config.get("REQUIRE_LOGIN_TO_BROWSE")),
         "selfRegistration": False,
     }
+    # Which fields an update request may propose, per asset type. Served from
+    # here so the browser cannot invent a field the server would reject.
+    data["updateRequestFieldsByType"] = {
+        type_id: reference.update_request_field_options(type_id)
+        for type_id in reference.ASSET_TYPE_IDS
+    }
     data["appVersion"] = __version__
     return ok(data)
 

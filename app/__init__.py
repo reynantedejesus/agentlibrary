@@ -300,7 +300,7 @@ def _assert_secret_key(app: Flask) -> None:
 def _init_extensions(app: Flask) -> None:
     from werkzeug.middleware.proxy_fix import ProxyFix
 
-    from app.extensions import csrf, db, limiter, login_manager, migrate
+    from app.extensions import csrf, db, limiter, migrate
 
     if app.config.get("PROXY_FIX_ENABLED"):
         # nginx sets X-Forwarded-For/-Proto/-Host; without this, remote_addr is
@@ -315,33 +315,8 @@ def _init_extensions(app: Flask) -> None:
     db.init_app(app)
     migrate.init_app(app, db, directory=os.path.join(PROJECT_ROOT, "migrations"))
     csrf.init_app(app)
-    login_manager.init_app(app)
-
     if limiter is not None and app.config.get("RATELIMIT_ENABLED"):
         limiter.init_app(app)
-
-    from app.models import User
-
-    @login_manager.user_loader
-    def _load_user(token: str):
-        # get_id() is "<id>|<password-hash-tail>"; a password change therefore
-        # invalidates every previously issued session cookie.
-        raw_id, _, fingerprint = (token or "").partition("|")
-        try:
-            user_id = int(raw_id)
-        except (TypeError, ValueError):
-            return None
-        user = db.session.get(User, user_id)
-        if user is None or not user.is_active:
-            return None
-        if fingerprint and (user.password_hash or "")[-16:] != fingerprint:
-            return None
-        return user
-
-    @login_manager.unauthorized_handler
-    def _unauthorized():
-        from app.errors import error
-        return error("AUTH_REQUIRED", "Sign in to continue.", 401)
 
 
 def _register_error_handlers(app: Flask) -> None:
@@ -355,11 +330,13 @@ def _register_blueprints(app: Flask) -> None:
     from app.api.auth import bp as auth_bp
     from app.api.files import bp as files_bp
     from app.api.meta import bp as meta_bp
+    from app.api.updates import bp as updates_bp
 
     app.register_blueprint(meta_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(assets_bp)
     app.register_blueprint(files_bp)
+    app.register_blueprint(updates_bp)
     app.register_blueprint(admin_bp)
 
 
@@ -369,14 +346,11 @@ def _register_page_routes(app: Flask) -> None:
     @app.route("/")
     def index():
         """The single-page shell. All data arrives over /api/*."""
-        from flask_login import current_user
-        viewer = None
-        if getattr(current_user, "is_authenticated", False):
-            viewer = current_user.to_dict()
+        from app.security import is_admin
         return render_template(
             "index.html",
             csrf_token=generate_csrf(),
-            bootstrap_user=viewer,
+            bootstrap_unlocked=is_admin(),
             app_version=__version__,
         )
 

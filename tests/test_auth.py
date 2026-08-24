@@ -1,74 +1,73 @@
-"""Login, logout, password change, lockout and role authorisation."""
+"""The admin unlock gate.
+
+There are no user accounts: browsing, submitting and raising an update request
+are open, and the Admin / Review console is protected by one shared password.
+These tests cover that the password is verified on the SERVER (never in the
+browser), that failures are throttled and audited, and that every protected
+endpoint refuses a locked session.
+"""
 import pytest
 
 from app.models import ActivityLog, User
-from tests.conftest import PASSWORD, data, err, login, make_user
+from tests.conftest import (PASSWORD, asset_payload, create_asset, data, err,
+                            make_admin, unlock)
 
 
-def test_login_succeeds_with_correct_credentials(client, normal_user):
-    payload = data(login(client, "uma@wings.test"))
-    assert payload["user"]["email"] == "uma@wings.test"
-    assert payload["user"]["role"] == "user"
+# ---------------------------------------------------------------------------
+# unlocking
+# ---------------------------------------------------------------------------
+def test_unlock_succeeds_with_the_right_password(client, admin_user):
+    payload = data(unlock(client))
+    assert payload["unlocked"] is True
     assert "csrfToken" in payload
-    assert "password" not in str(payload).lower()
+    # The password must never come back in a response.
+    assert PASSWORD not in str(payload)
 
 
-def test_login_fails_with_a_wrong_password(client, normal_user):
-    response = login(client, "uma@wings.test", "not-the-password")
+def test_unlock_fails_with_the_wrong_password(client, admin_user):
+    response = unlock(client, "not-the-password")
     assert response.status_code == 401
     assert err(response)["code"] == "INVALID_CREDENTIALS"
 
 
-def test_login_fails_for_an_unknown_address(client):
-    response = login(client, "nobody@wings.test", "whatever12345")
-    assert response.status_code == 401
-    assert err(response)["code"] == "INVALID_CREDENTIALS"
-
-
-def test_login_does_not_leak_whether_an_account_exists(client, normal_user):
-    unknown = err(login(client, "nobody@wings.test", "whatever12345"))
-    wrong = err(login(client, "uma@wings.test", "whatever12345"))
-    assert unknown["message"] == wrong["message"]
-    assert unknown["code"] == wrong["code"]
-
-
-def test_login_requires_both_fields(client):
-    response = client.post("/api/auth/login", json={"email": ""})
+def test_unlock_requires_a_password(client, admin_user):
+    response = client.post("/api/auth/unlock", json={})
     assert response.status_code == 400
-    fields = err(response)["fields"]
-    assert "email" in fields and "password" in fields
+    assert "password" in err(response)["fields"]
 
 
-def test_me_is_anonymous_before_login(client):
-    assert data(client.get("/api/auth/me"))["user"] is None
+def test_unlock_needs_no_email(client, admin_user):
+    """The console asks for a password only — there is nobody to identify."""
+    assert client.post("/api/auth/unlock",
+                       json={"password": PASSWORD}).status_code == 200
 
 
-def test_logout_clears_the_session(client, normal_user):
-    login(client, "uma@wings.test")
-    assert data(client.get("/api/auth/me"))["user"] is not None
-    client.post("/api/auth/logout")
-    assert data(client.get("/api/auth/me"))["user"] is None
+def test_me_reports_locked_before_unlocking(client, admin_user):
+    payload = data(client.get("/api/auth/me"))
+    assert payload["unlocked"] is False
+    assert payload["adminConfigured"] is True
 
 
-def test_inactive_account_cannot_log_in(client, app):
-    make_user("gone@wings.test", "user", active=False)
-    response = login(client, "gone@wings.test")
-    assert response.status_code == 403
-    assert err(response)["code"] == "ACCOUNT_DISABLED"
+def test_me_reports_unlocked_after(as_admin):
+    assert data(as_admin.get("/api/auth/me"))["unlocked"] is True
 
 
-def test_repeated_failures_lock_the_account(client, app, normal_user):
-    app.config["MAX_LOGIN_FAILURES"] = 3
-    for _ in range(3):
-        assert login(client, "uma@wings.test", "wrong-password").status_code == 401
-    # Even the correct password is refused while the lock holds.
-    response = login(client, "uma@wings.test", PASSWORD)
-    assert response.status_code == 403
-    assert err(response)["code"] == "ACCOUNT_LOCKED"
+def test_lock_ends_the_session(as_admin):
+    as_admin.post("/api/auth/lock")
+    assert data(as_admin.get("/api/auth/me"))["unlocked"] is False
+    assert as_admin.get("/api/admin/stats").status_code == 401
 
 
-def test_passwords_are_stored_as_hashes_only(app, normal_user):
-    stored = User.query.filter_by(email="uma@wings.test").one()
+def test_unlock_is_reported_when_no_admin_exists(client):
+    """A deployment step was skipped — say so rather than "wrong password"."""
+    response = client.post("/api/auth/unlock", json={"password": "anything123"})
+    assert response.status_code == 503
+    assert err(response)["code"] == "ADMIN_NOT_CONFIGURED"
+    assert data(client.get("/api/auth/me"))["adminConfigured"] is False
+
+
+def test_password_is_stored_only_as_a_hash(app, admin_user):
+    stored = User.query.one()
     assert stored.password_hash != PASSWORD
     assert PASSWORD not in stored.password_hash
     assert stored.password_hash.startswith("pbkdf2:sha256:")
@@ -76,113 +75,167 @@ def test_passwords_are_stored_as_hashes_only(app, normal_user):
     assert not stored.check_password(PASSWORD + "x")
 
 
-def test_change_password_requires_the_current_one(as_user):
-    response = as_user.post("/api/auth/change-password", json={
-        "currentPassword": "wrong", "newPassword": "AnotherGoodPassword1",
-    })
+def test_repeated_failures_lock_the_console(client, app, admin_user):
+    app.config["MAX_LOGIN_FAILURES"] = 3
+    for _ in range(3):
+        assert unlock(client, "wrong").status_code == 401
+    # Even the correct password is refused during the cooling-off period.
+    response = unlock(client, PASSWORD)
+    assert response.status_code == 403
+    assert err(response)["code"] == "ACCOUNT_LOCKED"
+
+
+def test_a_locked_session_cannot_be_forged_client_side(app, admin_user):
+    """The browser's idea of "unlocked" is a rendering hint, nothing more."""
+    client = app.test_client()
+    with client.session_transaction() as session:
+        session["admin_unlocked"] = True      # what a tampered client would do
+    # It is a signed cookie, so this only works because the test writes it
+    # through Flask itself; the point is that the server still checks it.
+    assert client.get("/api/admin/stats").status_code == 200
+    with client.session_transaction() as session:
+        session.clear()
+    assert client.get("/api/admin/stats").status_code == 401
+
+
+def test_session_cookie_is_httponly_and_samesite(app, admin_user):
+    app.config["SESSION_COOKIE_SECURE"] = True
+    client = app.test_client()
+    response = unlock(client)
+    cookies = [h for k, h in response.headers if k == "Set-Cookie"]
+    session_cookie = next(c for c in cookies if c.startswith("agentlibrary_session="))
+    assert "HttpOnly" in session_cookie
+    assert "Secure" in session_cookie
+    assert "SameSite=Lax" in session_cookie
+
+
+# ---------------------------------------------------------------------------
+# changing the password
+# ---------------------------------------------------------------------------
+def test_change_password_requires_being_unlocked(client, admin_user):
+    response = client.post("/api/auth/change-password", json={
+        "currentPassword": PASSWORD, "newPassword": "AnotherGoodPassword1"})
+    assert response.status_code == 401
+
+
+def test_change_password_requires_the_current_one(as_admin):
+    response = as_admin.post("/api/auth/change-password", json={
+        "currentPassword": "wrong", "newPassword": "AnotherGoodPassword1"})
     assert response.status_code == 403
     assert err(response)["code"] == "INVALID_CREDENTIALS"
 
 
-def test_change_password_rejects_a_weak_password(as_user):
-    response = as_user.post("/api/auth/change-password", json={
-        "currentPassword": PASSWORD, "newPassword": "short",
-    })
+def test_change_password_rejects_a_weak_password(as_admin):
+    response = as_admin.post("/api/auth/change-password", json={
+        "currentPassword": PASSWORD, "newPassword": "short"})
     assert response.status_code == 400
     assert "newPassword" in err(response)["fields"]
 
 
-def test_change_password_rejects_the_prototype_default(as_user):
-    response = as_user.post("/api/auth/change-password", json={
-        "currentPassword": PASSWORD, "newPassword": "Wings123+Wings123+",
-    })
+def test_change_password_rejects_the_prototype_default(as_admin):
+    """The HTML prototype shipped "Wings123+" in its source."""
+    response = as_admin.post("/api/auth/change-password", json={
+        "currentPassword": PASSWORD, "newPassword": "Wings123+Wings123+"})
     assert response.status_code == 400
 
 
-def test_change_password_works_and_invalidates_the_old_one(client, normal_user):
-    login(client, "uma@wings.test")
+def test_change_password_rotates_the_shared_secret(client, admin_user):
+    unlock(client)
     new_password = "AnotherGoodPassword1"
-    response = client.post("/api/auth/change-password", json={
+    assert client.post("/api/auth/change-password", json={
         "currentPassword": PASSWORD, "newPassword": new_password,
-        "confirmPassword": new_password,
-    })
-    assert response.status_code == 200
-    client.post("/api/auth/logout")
-    assert login(client, "uma@wings.test", PASSWORD).status_code == 401
-    assert login(client, "uma@wings.test", new_password).status_code == 200
+        "confirmPassword": new_password}).status_code == 200
+    client.post("/api/auth/lock")
+    assert unlock(client, PASSWORD).status_code == 401
+    assert unlock(client, new_password).status_code == 200
 
 
-def test_change_password_invalidates_other_sessions(app, normal_user):
-    """get_id() embeds part of the hash, so old cookies stop resolving."""
-    first = app.test_client()
-    second = app.test_client()
-    login(first, "uma@wings.test")
-    login(second, "uma@wings.test")
+def test_changing_the_password_locks_out_other_browsers(app, admin_user):
+    """Everyone holding the old password has to be told the new one."""
+    first, second = app.test_client(), app.test_client()
+    unlock(first)
+    unlock(second)
     first.post("/api/auth/change-password", json={
         "currentPassword": PASSWORD, "newPassword": "AnotherGoodPassword1",
-        "confirmPassword": "AnotherGoodPassword1",
-    })
-    assert data(second.get("/api/auth/me"))["user"] is None
-    assert data(first.get("/api/auth/me"))["user"] is not None
+        "confirmPassword": "AnotherGoodPassword1"})
+    # The already-open session keeps working; a NEW unlock needs the new secret.
+    assert second.get("/api/admin/stats").status_code == 200
+    second.post("/api/auth/lock")
+    assert unlock(second, PASSWORD).status_code == 401
+    assert unlock(second, "AnotherGoodPassword1").status_code == 200
 
 
 # ---------------------------------------------------------------------------
-# role authorisation
+# what is open, and what is not
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("path", [
-    "/api/my-submissions",
-    "/api/assets/next-code?department=Finance",
+def test_browsing_needs_no_password(client):
+    assert client.get("/api/assets").status_code == 200
+    assert client.get("/api/config").status_code == 200
+    assert client.get("/health").status_code == 200
+
+
+def test_submitting_needs_no_password(client):
+    """Matches the prototype: anyone can add to the Library."""
+    response = client.post("/api/assets", json=asset_payload())
+    assert response.status_code == 201
+    assert response.get_json()["data"]["asset"]["status"] == "Pending Review"
+
+
+def test_raising_an_update_request_needs_no_password(app, client):
+    from tests.conftest import publish, update_request_payload
+    asset = publish(app, client)
+    response = client.post("/api/update-requests",
+                           json=update_request_payload(asset["id"]))
+    assert response.status_code == 201
+
+
+@pytest.mark.parametrize("method,path", [
+    ("get", "/api/admin/activity"),
+    ("get", "/api/admin/stats"),
+    ("get", "/api/update-requests"),
 ])
-def test_authenticated_endpoints_reject_anonymous_callers(client, path):
-    response = client.get(path)
+def test_console_endpoints_refuse_a_locked_session(client, method, path):
+    response = getattr(client, method)(path)
     assert response.status_code == 401
     assert err(response)["code"] == "AUTH_REQUIRED"
 
 
-def test_anonymous_cannot_submit_an_asset(client):
-    from tests.conftest import asset_payload
-    response = client.post("/api/assets", json=asset_payload())
-    assert response.status_code == 401
+def test_governance_actions_refuse_a_locked_session(client):
+    asset = create_asset(client)
+    for path in ("approve", "reject", "archive"):
+        assert client.post("/api/assets/%d/%s" % (asset["id"], path)).status_code == 401
+    assert client.put("/api/assets/%d" % asset["id"],
+                      json=asset_payload()).status_code == 401
 
 
-@pytest.mark.parametrize("path", ["/api/admin/activity", "/api/admin/stats"])
-def test_admin_endpoints_reject_a_plain_user(as_user, path):
-    response = as_user.get(path)
-    assert response.status_code == 403
-    assert err(response)["code"] == "FORBIDDEN"
+def test_a_second_admin_row_does_not_change_the_password(app, admin_user):
+    """The oldest admin wins, so the answer is stable if a row is added."""
+    make_admin("second@wings.test", "Second", "DifferentPassword123")
+    client = app.test_client()
+    assert unlock(client, PASSWORD).status_code == 200
 
 
-def test_reviewer_can_read_the_activity_log(as_reviewer):
-    assert as_reviewer.get("/api/admin/activity").status_code == 200
-
-
-def test_user_administration_is_admin_only(as_reviewer):
-    assert as_reviewer.get("/api/admin/users").status_code == 403
-
-
-def test_admin_can_administer_users(as_admin):
-    assert as_admin.get("/api/admin/users").status_code == 200
-
-
-def test_admin_cannot_demote_themselves(as_admin, admin_user):
-    response = as_admin.patch("/api/admin/users/%d" % admin_user.id, json={"role": "user"})
-    assert response.status_code == 409
-    assert err(response)["code"] == "SELF_DEMOTION"
-
-
-def test_login_and_failure_are_audited(client, app, normal_user):
-    login(client, "uma@wings.test", "wrong")
-    login(client, "uma@wings.test")
-    client.post("/api/auth/logout")
+# ---------------------------------------------------------------------------
+# audit
+# ---------------------------------------------------------------------------
+def test_unlock_success_and_failure_are_audited(client, app, admin_user):
+    unlock(client, "wrong")
+    unlock(client)
+    client.post("/api/auth/lock")
     actions = [row.action for row in ActivityLog.query.all()]
     assert "login.failure" in actions
     assert "login.success" in actions
     assert "logout" in actions
 
 
-def test_password_change_is_audited(as_user):
-    as_user.post("/api/auth/change-password", json={
+def test_failed_unlock_records_the_source_address(client, admin_user):
+    unlock(client, "wrong")
+    entry = ActivityLog.query.filter_by(action="login.failure").one()
+    assert entry.ip == "127.0.0.1"
+
+
+def test_password_change_is_audited(as_admin):
+    as_admin.post("/api/auth/change-password", json={
         "currentPassword": PASSWORD, "newPassword": "AnotherGoodPassword1",
-        "confirmPassword": "AnotherGoodPassword1",
-    })
+        "confirmPassword": "AnotherGoodPassword1"})
     assert ActivityLog.query.filter_by(action="password.change").count() == 1

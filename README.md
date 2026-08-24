@@ -44,19 +44,47 @@ map, the schema and the migration plan are in **[`docs/ANALYSIS.md`](docs/ANALYS
 | --- | --- |
 | `localStorage` DataStore | MySQL via SQLAlchemy; every read/write is a Flask API call |
 | 16 hard-coded mock assets | Empty database; **no code path seeds demo assets** |
-| `AdminAuth` comparing `"Wings123+"` in page source | Flask-Login sessions, PBKDF2-SHA256 hashes, `user`/`reviewer`/`admin` roles |
-| Client-side `State.unlocked` flag | Server-enforced authorisation on every protected endpoint |
+| `AdminAuth` comparing `"Wings123+"` in page source | One shared admin password, stored as a PBKDF2-SHA256 hash and verified **server-side** |
+| Client-side `State.unlocked` flag | Server-enforced session; the client flag only decides what to draw |
 | Client-computed WGT codes (`max()+1`) | Server allocation inside a transaction, row-locked counter, `UNIQUE` constraint, bounded retry |
 | Simulated downloads (a toast) | Real uploads with validation and authorised, audited downloads |
 | `versions[0]` overwritten by approve/reject | Append-only `asset_versions` table |
 | Activity log written but never shown | `activity_log` table + an Admin activity view |
-| "My Submissions" mentioned in a comment only | Implemented, scoped server-side |
+| No update workflow | "Update an Agent": anyone proposes changes, an admin accepts or declines |
+| Knowledge Base as a free-text box | Real drag-and-drop uploads, validated and scanned |
 | No CSRF, no security headers | CSRF on every state-changing request, CSP, HSTS, nosniff, DENY framing |
 
-Preserved exactly: the boarding-pass card design, all five detail tabs, the
+Preserved exactly: the boarding-pass card design, the three detail tabs, the
 two-step wizard, filters, card/list views, toasts, confirmation modals,
 keyboard accessibility, `/` search shortcut, browser back/forward, and the
 responsive breakpoints.
+
+### Who can do what
+
+There are **no user accounts**. The model matches the prototype:
+
+| Action | Needs |
+| --- | --- |
+| Browse the approved catalogue | nothing |
+| Add to Library | nothing (goes to Pending Review) |
+| Update an Agent (propose a change) | nothing (goes to the review queue) |
+| Download a file on an approved asset | nothing |
+| Admin / Review — approve, reject, archive, edit, version, read the audit log | the shared admin password |
+
+The password is set by `flask create-admin`, stored only as a hash, and checked
+by the server on every protected request. Because it is one credential shared
+by whoever needs the console, it is defended accordingly: attempts are
+rate-limited per IP, repeated failures lock the console for a cooling-off
+period, and every attempt is written to the activity log with its source
+address. Rotate it with **Change Admin Password** in the console, or
+`flask reset-password`.
+
+> **What this costs.** Submissions and update requests carry the name and email
+> the person typed, which nothing verifies — the audit log records them as
+> unverified detail, not as an identity. The admin review screen warns when a
+> request comes from someone other than the asset's owner on record. If you
+> later want per-person attribution, the `users` table and its `role` column
+> are still there and `app/security.py` is the only place that decides.
 
 ---
 
@@ -88,7 +116,7 @@ agentlibrary/
 │   └── api/
 │       ├── meta.py              # /api/config, /health
 │       ├── auth.py              # login, logout, me, change-password
-│       ├── assets.py            # the /api/assets surface, /api/my-submissions
+│       ├── assets.py            # the /api/assets surface
 │       ├── files.py             # upload, download, delete
 │       └── admin.py             # activity, stats, users, dept migration
 │
@@ -99,6 +127,7 @@ agentlibrary/
 ├── static/fonts/README.md       # how to self-host the webfonts
 │
 ├── migrations/versions/0001_initial_schema.py
+│                       0002_update_requests.py
 ├── deploy/                      # systemd, nginx, logrotate, SELinux
 ├── scripts/backup.sh, restore.sh
 ├── tests/                       # 202 tests
@@ -446,18 +475,12 @@ Never leave `ADMIN_INITIAL_PASSWORD` in `agentlibrary.env`.
 Other account commands:
 
 ```bash
-flask create-user --email rob@wingsglobaltravel.com --role reviewer
-flask set-role --email rob@wingsglobaltravel.com --role admin
-flask reset-password --email rob@wingsglobaltravel.com
+# Rotate the shared password later:
+flask reset-password --email admin@wingsglobaltravel.com
 ```
 
-Roles:
-
-| Role | Can |
-| --- | --- |
-| `user` | browse, submit, edit their own pending/rejected submissions, upload files to their own assets |
-| `reviewer` | all of the above, plus approve / reject / archive / feature any asset and read the activity log |
-| `admin` | all of the above, plus manage user accounts and perform controlled department migrations |
+The `--email` is a label for the audit trail. Nobody signs in with it — the
+console asks for the password only.
 
 ---
 
@@ -812,6 +835,8 @@ sudo crontab -e
 
 ```cron
 15 3 * * * /opt/agentlibrary/scripts/backup.sh >> /var/log/agentlibrary/backup.log 2>&1
+# Sweep files uploaded to forms that were never submitted.
+45 3 * * * cd /opt/agentlibrary && FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask prune-uploads --hours 24 --yes >> /var/log/agentlibrary/prune.log 2>&1
 ```
 
 Each run produces a timestamped directory containing `database.sql.gz`,
@@ -883,8 +908,11 @@ cd /opt/agentlibrary
 export FLASK_APP=wsgi.py
 
 sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db current
-sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db downgrade -1     # one step
-sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db downgrade <rev>  # to a revision
+# One step back. Note the `--`: without it Click reads "-1" as an option and
+# refuses the command.
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db downgrade -- -1
+# Clearer, and what you want in a runbook — name the revision explicitly:
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db downgrade 0001_initial
 ```
 
 > **Take a backup before any downgrade.** A downgrade that drops a column
@@ -1002,35 +1030,39 @@ All responses use one of two envelopes:
 | --- | --- | --- | --- |
 | GET | `/health` | none | liveness + database |
 | GET | `/api/config` | none | reference lists and limits |
-| POST | `/api/auth/login` | none | rate-limited |
-| POST | `/api/auth/logout` | session | |
-| GET | `/api/auth/me` | none | `user: null` when anonymous |
+| POST | `/api/auth/unlock` | none | shared password; rate-limited |
+| POST | `/api/auth/lock` | none | ends the admin session |
+| GET | `/api/auth/me` | none | `{unlocked, adminConfigured}` |
 | GET | `/api/auth/csrf` | none | fresh token |
-| POST | `/api/auth/change-password` | session | invalidates other sessions |
+| POST | `/api/auth/change-password` | admin | rotates the shared password |
 | GET | `/api/assets` | browse | `q`, `asset_type`, `department`, `platform`, `tag`, `status`, `featured`, `review_due`, `sort`, `page`, `per_page` |
 | GET | `/api/assets/<id>` | browse¹ | full detail, all five tabs |
-| POST | `/api/assets` | user | allocates the WGT code |
-| PUT | `/api/assets/<id>` | owner/reviewer | department, code and type are immutable |
-| POST | `/api/assets/<id>/versions` | owner/reviewer | append-only |
+| POST | `/api/assets` | none | allocates the WGT code |
+| PUT | `/api/assets/<id>` | admin | department, code and type are immutable |
+| POST | `/api/assets/<id>/versions` | admin | append-only |
+| POST | `/api/uploads` | none | stage a file before its owner exists |
 | GET | `/api/assets/<id>/files` | browse¹ | |
-| POST | `/api/assets/<id>/files` | owner/reviewer | multipart/form-data |
+| POST | `/api/assets/<id>/files` | admin | multipart/form-data |
 | GET | `/api/files/<id>/download` | browse¹ | audited; `?disposition=inline` |
-| DELETE | `/api/files/<id>` | owner/reviewer | |
-| POST | `/api/assets/<id>/approve` | reviewer | |
-| POST | `/api/assets/<id>/reject` | reviewer | optional `reason` |
-| POST | `/api/assets/<id>/archive` | reviewer | "Remove from Library" |
-| GET | `/api/assets/next-code` | user | preview only, not a reservation |
-| GET | `/api/assets/duplicate-check` | user | |
-| GET | `/api/my-submissions` | user | scoped server-side |
-| GET | `/api/admin/activity` | reviewer | audit trail |
-| GET | `/api/admin/stats` | reviewer | dashboard counters |
-| GET/POST | `/api/admin/users` | admin | |
-| PATCH | `/api/admin/users/<id>` | admin | |
+| DELETE | `/api/files/<id>` | admin | |
+| POST | `/api/assets/<id>/approve` | admin | |
+| POST | `/api/assets/<id>/reject` | admin | optional `reason` |
+| POST | `/api/assets/<id>/archive` | admin | "Remove from Library" |
+| GET | `/api/assets/next-code` | none | preview only, not a reservation |
+| GET | `/api/assets/duplicate-check` | none | |
+| POST | `/api/update-requests` | none | propose a change |
+| GET | `/api/update-requests` | admin | the review queue |
+| GET | `/api/update-requests/<id>` | admin | full proposed content |
+| POST | `/api/update-requests/<id>/accept` | admin | applies it, appends a version |
+| POST | `/api/update-requests/<id>/decline` | admin | closes it, changes nothing |
+| GET | `/api/admin/activity` | admin | audit trail |
+| GET | `/api/admin/stats` | admin | dashboard counters |
 | POST | `/api/admin/assets/<id>/migrate-department` | admin | mints a new WGT code |
 
-¹ Approved assets are visible to anyone who may browse; anything else only to
-its creator/owner or a reviewer. Requesting a hidden asset returns **404**, not
-403, so the endpoint does not confirm that it exists.
+¹ Approved assets are visible to anyone who may browse; anything else is
+admin-only. Requesting a hidden asset returns **404**, not 403, so the endpoint
+does not confirm that it exists. Staged uploads and files proposed on an update
+request are likewise 404 until an admin session is present.
 
 Error codes: `VALIDATION_ERROR`, `AUTH_REQUIRED`, `INVALID_CREDENTIALS`,
 `ACCOUNT_LOCKED`, `ACCOUNT_DISABLED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`,
@@ -1057,8 +1089,9 @@ flake8 app tests wsgi.py gunicorn.conf.py
 | File | Covers |
 | --- | --- |
 | `test_health_and_config.py` | health endpoint, reference data, security headers, JSON 404 envelope |
-| `test_auth.py` | login, logout, wrong credentials, user enumeration, lockout, password hashing, change-password, session invalidation, role authorisation, audit |
-| `test_assets.py` | creation, required-field validation, vocabulary validation, dangerous URL schemes, search, SQL-injection and wildcard handling, filtering, sorting, pagination, IDOR on detail and update, immutability, versions, approve/reject/archive, my-submissions scoping, duplicate detection |
+| `test_auth.py` | unlock, lock, wrong password, lockout after repeated failures, password hashing, rotation, what is open vs gated, audit |
+| `test_update_requests.py` | raising a request, per-type field validation, that a request never touches the asset, authorisation, accepting (single and multi-field, owner change, file replacement), declining, owner-mismatch flagging, transaction rollback, the admin queue |
+| `test_assets.py` | creation, required-field validation, vocabulary validation, dangerous URL schemes, search, SQL-injection and wildcard handling, filtering, sorting, pagination, IDOR on detail and update, immutability, versions, approve/reject/archive, duplicate detection |
 | `test_wgt_codes.py` | digit mapping, format, prefix ambiguity (`WGT101` vs `WGT1001`), sequential allocation, uniqueness constraint, **concurrent allocation across four threads**, legacy-import collisions, department migration |
 | `test_files.py` | extension/MIME/magic-byte/size validation, random stored names, storage outside `static`, file permissions, path traversal, upload and download authorisation, tampered-path containment, deletion, audit |
 | `test_security.py` | CSRF absent/forged/cross-session, cookie flags, XSS-safe rendering, bootstrap escaping, transaction rollback (asset, WGT counter, orphaned file), error-message disclosure, trusted hosts, full audit coverage |
@@ -1233,7 +1266,10 @@ Work through this before going live. Every item is verifiable with a command.
 - [ ] `SESSION_COOKIE_SECURE=1`, `SameSite=Lax`, HttpOnly (check `curl -sI`)
 - [ ] CSRF rejects a token-less POST (`curl -X POST .../api/auth/login` → 400)
 - [ ] `MAX_CONTENT_LENGTH` matches nginx `client_max_body_size`
-- [ ] Rate limiting enabled; Redis configured if `GUNICORN_WORKERS > 1`
+- [ ] Rate limiting enabled; **Redis configured if `GUNICORN_WORKERS > 1`** — with
+      `memory://` the login throttle is per-worker, which matters more now that
+      one shared password guards the console
+- [ ] `flask prune-uploads` scheduled (sweeps files attached to abandoned forms)
 - [ ] `pytest -q` passes on the deployed checkout
 
 ### Database
@@ -1242,9 +1278,9 @@ Work through this before going live. Every item is verifiable with a command.
 - [ ] `bind-address = 127.0.0.1` (or firewalled to this host only)
 - [ ] Runtime user has SELECT/INSERT/UPDATE/DELETE only — no `GRANT`, `FILE`, `SUPER`
 - [ ] `SHOW GRANTS FOR 'agentlibrary'@'127.0.0.1';` reviewed
-- [ ] `flask db current` matches the deployed migration head
+- [ ] `flask db current` matches the deployed migration head (`0002_update_requests`)
 - [ ] `flask seed-config` run; **no demo assets** (`flask show-status` → `Assets: 0`)
-- [ ] At least one admin exists and can sign in
+- [ ] Admin password set and unlocks the console
 
 ### Files
 

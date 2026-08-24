@@ -1,8 +1,9 @@
 """Authorization decorators, security headers and host validation.
 
-Authentication itself is Flask-Login session cookies (see ``app/api/auth.py``);
-this module decides *what an authenticated user may do* and enforces it on the
-server for every protected endpoint. Nothing here trusts a client-side flag.
+Authentication is a single shared admin password held in a signed session
+cookie (see ``app/api/auth.py``); this module decides *what a caller may do*
+and enforces it on the server for every protected endpoint. Nothing here
+trusts a client-side flag.
 
 Connects to: every blueprint in ``app/api`` (decorators), and
 ``app/__init__.py`` (``install_security_headers``, ``check_trusted_host``).
@@ -13,10 +14,9 @@ import functools
 from typing import Callable, Optional
 
 from flask import current_app, request
-from flask_login import current_user
 
 from app import reference
-from app.errors import AuthRequired, Forbidden
+from app.errors import AuthRequired
 
 # A conservative CSP. The app inlines no scripts, but it does inline a handful
 # of SVG icons and uses Google Fonts, so styles and fonts allow those origins.
@@ -79,81 +79,69 @@ def check_trusted_host(app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# decorators
+# authorization
 # ---------------------------------------------------------------------------
-def login_required_json(view: Callable) -> Callable:
-    """Like flask_login.login_required, but 401 JSON instead of a redirect."""
+# The Agent Library has no user accounts. Browsing, submitting a new asset and
+# raising an update request are all open; the Admin / Review console is gated
+# by a single shared password, verified server-side against a hash and held in
+# a signed, HttpOnly session cookie (see app/api/auth.py).
+#
+# Everything below still enforces on the server. The client's idea of whether
+# it is "unlocked" is a rendering hint only — every protected view re-checks
+# the session here, so editing the browser's state grants nothing.
+SESSION_ADMIN_KEY = "admin_unlocked"
+
+
+def is_admin() -> bool:
+    """Whether this request carries a valid admin session."""
+    from flask import session
+    return session.get(SESSION_ADMIN_KEY) is True
+
+
+def admin_required(view: Callable) -> Callable:
+    """Refuse the request unless the admin password has been entered."""
 
     @functools.wraps(view)
     def wrapper(*args, **kwargs):
-        if not getattr(current_user, "is_authenticated", False):
-            raise AuthRequired()
-        if not current_user.is_active:
-            raise Forbidden("This account has been disabled.")
+        if not is_admin():
+            raise AuthRequired("Enter the admin password to continue.")
         return view(*args, **kwargs)
 
     return wrapper
 
 
-def role_required(minimum: str) -> Callable:
-    """Require at least ``minimum`` role (user < reviewer < admin)."""
-
-    def decorator(view: Callable) -> Callable:
-        @functools.wraps(view)
-        def wrapper(*args, **kwargs):
-            if not getattr(current_user, "is_authenticated", False):
-                raise AuthRequired()
-            if not current_user.is_active:
-                raise Forbidden("This account has been disabled.")
-            if not current_user.has_role(minimum):
-                raise Forbidden(
-                    "This action requires the {0} role.".format(minimum))
-            return view(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-reviewer_required = role_required(reference.ROLE_REVIEWER)
-admin_required = role_required(reference.ROLE_ADMIN)
+# Kept as an alias so the intent reads correctly at review-only call sites and
+# so a future move back to per-person roles has one place to change.
+reviewer_required = admin_required
 
 
 def browse_permitted() -> bool:
     """Whether the caller may read the approved catalogue.
 
-    Anonymous browsing matches the prototype and is the default; set
-    ``REQUIRE_LOGIN_TO_BROWSE=1`` to require a session for reads too.
+    Open by default, matching the prototype. Set ``REQUIRE_LOGIN_TO_BROWSE=1``
+    to require the admin password even to browse (useful if the site is ever
+    exposed beyond the internal network).
     """
     if not current_app.config.get("REQUIRE_LOGIN_TO_BROWSE", False):
         return True
-    return bool(getattr(current_user, "is_authenticated", False))
+    return is_admin()
 
 
 def require_browse() -> None:
     if not browse_permitted():
-        raise AuthRequired("Sign in to browse the Agent Library.")
-
-
-def current_user_or_none() -> Optional[object]:
-    return current_user if getattr(current_user, "is_authenticated", False) else None
+        raise AuthRequired("Enter the admin password to browse the Agent Library.")
 
 
 def can_view_asset(asset) -> bool:
     """IDOR guard for a single asset.
 
     Approved assets are visible to anyone allowed to browse. Everything else
-    (pending, rejected, deprecated, archived) is visible only to its
-    creator/owner or to a reviewer/admin.
+    — pending, rejected, deprecated, archived — is admin-only, because with no
+    accounts there is nobody else who could legitimately be its owner.
     """
     if asset.status == reference.STATUS_APPROVED:
         return browse_permitted()
-    viewer = current_user_or_none()
-    if viewer is None:
-        return False
-    if viewer.has_role(reference.ROLE_REVIEWER):
-        return True
-    return asset.creator_id == viewer.id or asset.owner_id == viewer.id
+    return is_admin()
 
 
 def assert_can_view_asset(asset) -> None:
@@ -164,8 +152,23 @@ def assert_can_view_asset(asset) -> None:
 
 
 def assert_can_edit_asset(asset) -> None:
-    if not asset.viewer_can_edit(current_user_or_none()):
-        if not getattr(current_user, "is_authenticated", False):
-            raise AuthRequired()
-        raise Forbidden("You can only edit your own submissions "
-                        "while they are pending or rejected.")
+    """Only an administrator edits a record once it has been submitted."""
+    if not is_admin():
+        raise AuthRequired("Enter the admin password to edit this asset.")
+
+
+def current_user_or_none() -> Optional[object]:
+    """The admin account backing this session, when there is one.
+
+    Used for audit attribution. Returns None for anonymous callers, which is
+    the normal case for browsing and submitting.
+    """
+    if not is_admin():
+        return None
+    from flask import session
+    from app.extensions import db
+    from app.models import User
+    user_id = session.get("admin_user_id")
+    if not user_id:
+        return None
+    return db.session.get(User, user_id)

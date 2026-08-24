@@ -1,13 +1,17 @@
 """Flask CLI commands.
 
     flask create-admin --email admin@example.com     # interactive password prompt
-    flask create-user  --email a@b.c --role reviewer
-    flask set-role     --email a@b.c --role admin
-    flask reset-password --email a@b.c
+    flask reset-password --email a@b.c                # rotate the console password
     flask seed-config                                 # reference data ONLY
     flask import-legacy dump.json [--dry-run]         # optional localStorage import
     flask show-status                                 # quick health/inventory check
     flask prune-activity --days 730
+    flask prune-uploads --hours 24                    # sweep unclaimed uploads
+
+There are no end-user accounts: the Admin / Review console is gated by one
+shared password, stored as a hash on a single ``users`` row. ``create-admin``
+sets it and ``reset-password`` rotates it. The ``--email`` is just a label for
+the audit trail; nobody signs in with it.
 
 No password is ever hard-coded. ``create-admin`` prompts on a TTY; in an
 automated deployment it reads ``ADMIN_INITIAL_PASSWORD`` from the environment
@@ -107,36 +111,7 @@ def register_cli(app) -> None:
         """Create (or reset) the initial administrator account."""
         user = _upsert_user(email, full_name, reference.ROLE_ADMIN, force)
         click.echo("Administrator ready: {0}".format(user.email))
-
-    @app.cli.command("create-user")
-    @click.option("--email", required=True)
-    @click.option("--name", "full_name", default="")
-    @click.option("--role", default=reference.ROLE_USER,
-                  type=click.Choice(reference.ROLES))
-    @click.option("--force", is_flag=True)
-    @with_appcontext
-    def create_user(email, full_name, role, force):
-        """Create a user, reviewer or admin account."""
-        user = _upsert_user(email, full_name, role, force)
-        click.echo("Created {0} with role {1}".format(user.email, user.role))
-
-    @app.cli.command("set-role")
-    @click.option("--email", required=True)
-    @click.option("--role", required=True, type=click.Choice(reference.ROLES))
-    @with_appcontext
-    def set_role(email, role):
-        """Change an existing account's role."""
-        from app import audit
-        from app.models import User
-
-        user = User.query.filter_by(email=email.strip().lower()).first()
-        if not user:
-            raise click.ClickException("No such user: {0}".format(email))
-        previous, user.role = user.role, role
-        audit.record(audit.USER_UPDATE, user,
-                     {"from": previous, "to": role, "via": "cli"}, actor_email="cli")
-        db.session.commit()
-        click.echo("{0}: {1} -> {2}".format(user.email, previous, role))
+        click.echo("The Admin / Review console now accepts that password.")
 
     @app.cli.command("reset-password")
     @click.option("--email", required=True)
@@ -197,7 +172,15 @@ def register_cli(app) -> None:
             count = db.session.query(func.count(Asset.id)).filter(
                 Asset.status == status).scalar()
             click.echo("  {0:<16}{1}".format(status, count))
-        click.echo("Files     : {0}".format(db.session.query(func.count(AssetFile.id)).scalar()))
+        click.echo("Files     : {0} ({1} unclaimed)".format(
+            db.session.query(func.count(AssetFile.id)).scalar(),
+            db.session.query(func.count(AssetFile.id))
+            .filter(AssetFile.asset_id.is_(None),
+                    AssetFile.update_request_id.is_(None)).scalar()))
+        from app.models import UpdateRequest
+        click.echo("Updates   : {0} open".format(
+            db.session.query(func.count(UpdateRequest.id))
+            .filter(UpdateRequest.status == reference.UPDATE_STATUS_OPEN).scalar()))
         click.echo("Activity  : {0}".format(db.session.query(func.count(ActivityLog.id)).scalar()))
         click.echo("WGT counters: {0}".format(wgt.counter_state()))
 
@@ -222,6 +205,46 @@ def register_cli(app) -> None:
         query.delete(synchronize_session=False)
         db.session.commit()
         click.echo("Deleted {0} rows.".format(count))
+
+    @app.cli.command("prune-uploads")
+    @click.option("--hours", default=24, show_default=True,
+                  help="Delete unclaimed uploads older than this.")
+    @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+    @with_appcontext
+    def prune_uploads(hours, yes):
+        """Delete files uploaded but never attached to anything.
+
+        The submission forms upload attachments before the record exists, so an
+        abandoned form leaves bytes on disk with nothing pointing at them. This
+        sweeps them up. Run it daily from cron alongside the backup.
+        """
+        import datetime as dt
+        from app import storage
+        from app.models import AssetFile
+
+        cutoff = dt.datetime.utcnow() - dt.timedelta(hours=hours)
+        rows = (AssetFile.query
+                .filter(AssetFile.asset_id.is_(None),
+                        AssetFile.update_request_id.is_(None),
+                        AssetFile.created_at < cutoff)
+                .all())
+        if not rows:
+            click.echo("No unclaimed uploads older than {0}h.".format(hours))
+            return
+        if not yes and not click.confirm("Delete {0} unclaimed uploads?".format(len(rows))):
+            return
+
+        removed = 0
+        for row in rows:
+            relative_path = row.relative_path
+            db.session.delete(row)
+            try:
+                storage.discard(relative_path)
+                removed += 1
+            except Exception:
+                click.echo("  could not remove {0}".format(relative_path), err=True)
+        db.session.commit()
+        click.echo("Deleted {0} unclaimed uploads.".format(removed))
 
     @app.cli.command("import-legacy")
     @click.argument("path", type=click.Path(exists=True, dir_okay=False))

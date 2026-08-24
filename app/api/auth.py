@@ -1,29 +1,31 @@
-"""Authentication and account endpoints.
+"""Admin unlock — the Agent Library's only authentication.
 
-Replaces the prototype's ``AdminAuth`` module, which compared a plaintext
-password held in ``localStorage`` against a constant in the page source.
+There are no user accounts. Browsing the catalogue, submitting a new asset and
+raising an update request are all open, exactly as in the prototype. The Admin
+/ Review console is gated by a single shared password.
 
-    POST /api/auth/login            email + password -> session cookie
-    POST /api/auth/logout
-    GET  /api/auth/me               current user (200 with null when anonymous)
-    POST /api/auth/change-password  current + new password
-    GET  /api/auth/csrf             a fresh CSRF token
+    POST /api/auth/unlock          {"password": "..."} -> admin session
+    POST /api/auth/lock            end the admin session
+    GET  /api/auth/me              {"unlocked": bool, "csrfToken": "..."}
+    POST /api/auth/change-password {"currentPassword", "newPassword"}
+    GET  /api/auth/csrf            a fresh CSRF token
 
-Defences
---------
-* Passwords are PBKDF2-SHA256 hashes (``User.set_password``); plaintext is
-  never stored, logged or returned.
-* Failed attempts increment a counter and lock the account for
-  ``LOGIN_LOCKOUT_SECONDS`` after ``MAX_LOGIN_FAILURES``.
-* Flask-Limiter throttles the login route (``RATELIMIT_LOGIN``).
-* The response is identical for "no such user" and "wrong password", so the
-  endpoint is not a user-enumeration oracle.
-* ``session.clear()`` before login rotates the session identifier, defeating
-  session fixation. Changing the password invalidates every existing session,
-  because ``User.get_id()`` embeds a fragment of the hash.
+How this differs from the prototype it replaces
+-----------------------------------------------
+The prototype compared ``attempt === CONFIG.defaultAdminPassword`` in
+JavaScript, with the password visible in page source. Here the password never
+leaves the server: it is stored only as a PBKDF2-SHA256 hash on a single
+``users`` row, compared with a constant-time digest check, and success sets a
+signed HttpOnly session cookie. Editing ``State`` in the browser console grants
+nothing, because every protected endpoint re-checks the session server-side.
 
-Connects to: ``app/models.py`` (User), ``app/security.py`` (decorators),
-``app/audit.py`` (login/logout/password events).
+A single shared secret is one credential for everyone, so it gets defended
+accordingly: failed attempts are throttled per IP by Flask-Limiter, repeated
+failures lock the console for a cooling-off period, and every attempt —
+successful or not — is written to the activity log with its source address.
+
+Connects to: ``app/security.py`` (``is_admin``/``admin_required``),
+``app/models.py`` (the admin ``User`` row), ``app/audit.py``.
 """
 from __future__ import annotations
 
@@ -31,21 +33,20 @@ import datetime as dt
 import logging
 
 from flask import Blueprint, current_app, request, session
-from flask_login import current_user, login_user, logout_user
 from flask_wtf.csrf import generate_csrf
 
-from app import audit
-from app.errors import ApiError, AuthRequired, ok
+from app import audit, reference
+from app.errors import ApiError, ok
 from app.extensions import db, limiter
 from app.models import User, utcnow
-from app.security import login_required_json
-from app.validators import validate_login, validate_new_password
+from app.security import SESSION_ADMIN_KEY, admin_required, is_admin
+from app.validators import Validator, validate_new_password
 
 log = logging.getLogger(__name__)
 
 bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
-GENERIC_LOGIN_FAILURE = "That email address and password combination wasn't recognised."
+WRONG_PASSWORD = "Incorrect password."
 
 
 def _json_body() -> dict:
@@ -65,116 +66,144 @@ def _rate_limit(rule_key: str):
     return decorator
 
 
+def admin_account():
+    """The single account whose hash backs the shared password.
+
+    Created by ``flask create-admin``. If several exist (an older multi-user
+    deployment), the oldest admin wins so the answer is stable.
+    """
+    return (User.query
+            .filter_by(role=reference.ROLE_ADMIN)
+            .order_by(User.id.asc())
+            .first())
+
+
 @bp.route("/csrf", methods=["GET"])
 def csrf_token():
-    """Hand the SPA a fresh token after login or a session rotation."""
+    """Hand the page a fresh token after the session rotates."""
     return ok({"csrfToken": generate_csrf()})
 
 
 @bp.route("/me", methods=["GET"])
 def me():
-    """Who is signed in. 200 with ``user: null`` when anonymous, so the SPA can
-    boot without treating "not logged in" as an error."""
-    payload = {"user": None, "csrfToken": generate_csrf()}
-    if getattr(current_user, "is_authenticated", False):
-        payload["user"] = current_user.to_dict()
-    return ok(payload)
+    """Whether this browser holds an admin session.
+
+    Always 200 — "locked" is the normal state, not an error, so the page can
+    boot without treating it as one.
+    """
+    account = admin_account()
+    return ok({
+        "unlocked": is_admin(),
+        "adminConfigured": account is not None,
+        "csrfToken": generate_csrf(),
+    })
 
 
-@bp.route("/login", methods=["POST"])
+@bp.route("/unlock", methods=["POST"])
 @_rate_limit("RATELIMIT_LOGIN")
-def login():
-    email, password = validate_login(_json_body())
-    user = User.query.filter_by(email=email).first()
+def unlock():
+    """Verify the shared admin password and open an admin session."""
+    body = _json_body()
+    password = body.get("password")
+    if not isinstance(password, str) or not password:
+        v = Validator(body)
+        v.fail("password", "Enter the admin password.")
+        v.raise_if_invalid("Enter the admin password.")
 
-    if user is not None and user.is_locked:
-        audit.record_now(audit.LOGIN_LOCKED, user, {"email": email})
+    account = admin_account()
+    if account is None:
+        # Nothing to compare against. Say so plainly: this is a deployment
+        # step that has not been run, not a wrong password.
+        log.error("Admin unlock attempted but no administrator account exists")
+        raise ApiError(
+            "ADMIN_NOT_CONFIGURED",
+            "No administrator password has been set up yet. Run "
+            "`flask create-admin` on the server first.",
+            503,
+        )
+
+    now = utcnow()
+    if account.locked_until and account.locked_until > now:
+        audit.record_now(audit.LOGIN_LOCKED, account, {"reason": "cooling off"})
         raise ApiError(
             "ACCOUNT_LOCKED",
-            "This account is temporarily locked after too many failed attempts. "
-            "Try again later or ask an administrator to reset it.",
+            "Too many incorrect attempts. Try again in a few minutes.",
             403,
         )
 
-    if user is None or not user.check_password(password):
-        if user is not None:
-            user.failed_login_count = int(user.failed_login_count or 0) + 1
-            maximum = current_app.config.get("MAX_LOGIN_FAILURES", 8)
-            if user.failed_login_count >= maximum:
-                user.locked_until = utcnow() + dt.timedelta(
-                    seconds=current_app.config.get("LOGIN_LOCKOUT_SECONDS", 900))
-                user.failed_login_count = 0
-                log.warning("Account locked after repeated failures: %s", email)
-        # Log the attempt even for unknown addresses — that is the signal an
-        # analyst needs during credential stuffing.
-        audit.record_now(audit.LOGIN_FAILURE, user, {"email": email},
-                         actor_email=email)
-        raise ApiError("INVALID_CREDENTIALS", GENERIC_LOGIN_FAILURE, 401)
+    if not account.check_password(password):
+        account.failed_login_count = int(account.failed_login_count or 0) + 1
+        maximum = current_app.config.get("MAX_LOGIN_FAILURES", 8)
+        if account.failed_login_count >= maximum:
+            account.locked_until = now + dt.timedelta(
+                seconds=current_app.config.get("LOGIN_LOCKOUT_SECONDS", 900))
+            account.failed_login_count = 0
+            log.warning("Admin console locked after %s failed attempts from %s",
+                        maximum, request.remote_addr)
+        audit.record_now(audit.LOGIN_FAILURE, account,
+                         {"attempts": account.failed_login_count})
+        raise ApiError("INVALID_CREDENTIALS", WRONG_PASSWORD, 401)
 
-    if not user.is_active:
-        audit.record_now(audit.LOGIN_FAILURE, user, {"reason": "inactive"},
-                         actor_email=email)
-        raise ApiError("ACCOUNT_DISABLED", "This account has been disabled.", 403)
-
-    # Rotate the session id before establishing the new identity.
+    # Rotate the session id before granting the new privilege level.
     session.clear()
-    login_user(user, remember=False)
+    session[SESSION_ADMIN_KEY] = True
+    session["admin_user_id"] = account.id
     session.permanent = True
 
-    user.failed_login_count = 0
-    user.locked_until = None
-    user.last_login_at = utcnow()
-    audit.record(audit.LOGIN_SUCCESS, user, {"role": user.role})
+    account.failed_login_count = 0
+    account.locked_until = None
+    account.last_login_at = now
+    audit.record(audit.LOGIN_SUCCESS, account, {"console": "admin"})
     db.session.commit()
 
-    log.info("Login success for %s (role=%s)", user.email, user.role)
-    return ok({"user": user.to_dict(), "csrfToken": generate_csrf()})
+    log.info("Admin console unlocked from %s", request.remote_addr)
+    return ok({"unlocked": True, "csrfToken": generate_csrf()})
 
 
-@bp.route("/logout", methods=["POST"])
-def logout():
-    if getattr(current_user, "is_authenticated", False):
-        audit.record(audit.LOGOUT, current_user)
+@bp.route("/lock", methods=["POST"])
+def lock():
+    """End the admin session."""
+    if is_admin():
+        account = admin_account()
+        audit.record(audit.LOGOUT, account, {"console": "admin"})
         db.session.commit()
-    logout_user()
     session.clear()
-    return ok({"user": None, "csrfToken": generate_csrf()})
+    return ok({"unlocked": False, "csrfToken": generate_csrf()})
 
 
 @bp.route("/change-password", methods=["POST"])
-@login_required_json
+@admin_required
 @_rate_limit("RATELIMIT_WRITE")
 def change_password():
+    """Rotate the shared admin password. Requires the current one."""
     body = _json_body()
+    account = admin_account()
+    if account is None:
+        raise ApiError("ADMIN_NOT_CONFIGURED",
+                       "No administrator account exists.", 503)
+
     current_password = body.get("currentPassword")
-    if not isinstance(current_password, str) or not current_user.check_password(current_password):
-        audit.record_now(audit.LOGIN_FAILURE, current_user,
+    if not isinstance(current_password, str) or not account.check_password(current_password):
+        audit.record_now(audit.LOGIN_FAILURE, account,
                          {"reason": "wrong current password on change"})
-        raise ApiError("INVALID_CREDENTIALS", "Your current password is incorrect.", 403,
-                       {"currentPassword": "Incorrect password."})
+        raise ApiError("INVALID_CREDENTIALS", "The current password is incorrect.",
+                       403, {"currentPassword": WRONG_PASSWORD})
 
     new_password = validate_new_password(body)
     if new_password == current_password:
-        raise ApiError("VALIDATION_ERROR", "The new password must differ from the old one.",
-                       400, {"newPassword": "Choose a different password."})
+        raise ApiError("VALIDATION_ERROR",
+                       "The new password must differ from the old one.", 400,
+                       {"newPassword": "Choose a different password."})
 
-    user = current_user._get_current_object()
-    user.set_password(new_password)
-    audit.record(audit.PASSWORD_CHANGE, user, {"self_service": True})
+    account.set_password(new_password)
+    audit.record(audit.PASSWORD_CHANGE, account, {"console": "admin"})
     db.session.commit()
 
-    # get_id() embeds the hash tail, so every other session for this account is
-    # now invalid. Re-login the current one so the user is not signed out here.
+    # Everyone else holding the old password is now out; keep this browser in.
     session.clear()
-    login_user(user, remember=False)
+    session[SESSION_ADMIN_KEY] = True
+    session["admin_user_id"] = account.id
     session.permanent = True
-    log.info("Password changed for %s", user.email)
-    return ok({"user": user.to_dict(), "csrfToken": generate_csrf()})
 
-
-@bp.route("/session", methods=["GET"])
-def session_info():
-    """Small helper the SPA polls after a 401 to decide whether to prompt."""
-    if not getattr(current_user, "is_authenticated", False):
-        raise AuthRequired()
-    return ok({"user": current_user.to_dict()})
+    log.info("Admin password rotated from %s", request.remote_addr)
+    return ok({"unlocked": True, "csrfToken": generate_csrf()})

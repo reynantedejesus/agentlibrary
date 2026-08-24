@@ -67,6 +67,12 @@
     <p class="sr-only" id="live-region" role="status" aria-live="polite"></p>
 
     <main id="view-root" tabindex="-1"></main>
+
+    <footer id="app-footer">
+      <p>Questions or trouble accessing or uploading an agent? Contact the WGT
+        Automation team at
+        <a href="mailto:WGT.Automation@wings.travel">WGT.Automation@wings.travel</a>.</p>
+    </footer>
   </div>
 </div>
 
@@ -87,9 +93,12 @@
 {# Bootstrap data as JSON, parsed by app.js. Using a JSON script block rather
    than inline JavaScript keeps the strict Content-Security-Policy intact
    (no 'unsafe-inline' for scripts) and makes injection impossible: the
-   browser never executes this, it only parses it. #}
+   browser never executes this, it only parses it.
+
+   `unlocked` is a rendering hint for the first paint only — the server
+   re-checks the session on every protected request regardless. #}
 <script type="application/json" id="bootstrap-data">
-{{ {"user": bootstrap_user, "version": app_version} | tojson }}
+{{ {"unlocked": bootstrap_unlocked, "version": app_version} | tojson }}
 </script>
 
 <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>

@@ -18,7 +18,6 @@ import logging
 from typing import Any, Dict, Optional
 
 from flask import has_request_context, request
-from flask_login import current_user
 
 from app.extensions import db
 from app.models import ActivityLog
@@ -34,6 +33,10 @@ PASSWORD_CHANGE = "password.change"
 USER_CREATE = "user.create"
 USER_UPDATE = "user.update"
 ASSET_SUBMIT = "asset.submit"
+UPDATE_REQUEST_SUBMIT = "update_request.submit"
+UPDATE_REQUEST_ACCEPT = "update_request.accept"
+UPDATE_REQUEST_DECLINE = "update_request.decline"
+UPLOAD_STAGED = "file.stage"
 ASSET_UPDATE = "asset.update"
 ASSET_APPROVE = "asset.approve"
 ASSET_REJECT = "asset.reject"
@@ -60,10 +63,18 @@ def _user_agent() -> Optional[str]:
 
 
 def _actor(actor=None):
+    """Who performed this action.
+
+    With no user accounts, most actions are anonymous: submissions and update
+    requests carry only the name the person typed, which is recorded in
+    ``detail`` rather than treated as an identity. The one real actor is the
+    admin session, so that is what this resolves.
+    """
     if actor is not None:
         return actor
-    if has_request_context() and getattr(current_user, "is_authenticated", False):
-        return current_user
+    if has_request_context():
+        from app.security import current_user_or_none
+        return current_user_or_none()
     return None
 
 

@@ -7,10 +7,17 @@
     POST   /api/assets/<id>/versions         add a version
     POST   /api/assets/<id>/approve          reviewer/admin
     POST   /api/assets/<id>/reject           reviewer/admin
-    POST   /api/assets/<id>/archive          reviewer/admin ("Remove from Library")
+    POST   /api/assets/<id>/archive          admin ("Remove from Library")
     GET    /api/assets/next-code             WGT preview for the wizard
     GET    /api/assets/duplicate-check        near-duplicate warning
-    GET    /api/my-submissions               the signed-in user's submissions
+
+Who may do what
+---------------
+There are no user accounts. Browsing the approved catalogue and submitting a
+new asset are open to anyone, matching the prototype. Everything that changes
+a record once it exists — editing, versioning, approving, rejecting, archiving
+— requires the shared admin password (``admin_required``). Submissions are
+rate-limited because they are unauthenticated.
 
 Invariants enforced here, not in the browser
 --------------------------------------------
@@ -34,17 +41,15 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, request
-from flask_login import current_user
 from sqlalchemy import or_
 from sqlalchemy.orm import joinedload
 
 from app import audit, reference, wgt
-from app.errors import ApiError, Conflict, NotFound, ValidationError, ok
+from app.errors import Conflict, NotFound, ValidationError, ok
 from app.extensions import db, limiter
-from app.models import Asset, AssetTag, AssetVersion, Tag, User, utcnow
-from app.security import (assert_can_edit_asset, assert_can_view_asset,
-                          current_user_or_none, login_required_json,
-                          require_browse, reviewer_required)
+from app.models import Asset, AssetFile, AssetTag, AssetVersion, Tag, User, utcnow
+from app.security import (admin_required, assert_can_view_asset,
+                          current_user_or_none, is_admin, require_browse)
 from app.validators import (Validator, validate_asset_submission,
                             validate_version_payload)
 
@@ -79,6 +84,66 @@ def _rate_limit_write(view):
         exempt_when=lambda: not current_app.config.get("RATELIMIT_ENABLED", True),
         methods=["POST", "PUT", "PATCH", "DELETE"],
     )(view)
+
+
+# ---------------------------------------------------------------------------
+# staged uploads
+# ---------------------------------------------------------------------------
+FILE_FIELD_TO_KIND = {"knowledgeFileIds": "knowledge", "contextFileIds": "context"}
+
+# Which file groups each asset type is allowed to carry, so a crafted request
+# cannot attach "context" files to a ChatGPT GPT.
+TYPE_FILE_FIELDS = {
+    "gpt": ["knowledgeFileIds"],
+    "agent": ["knowledgeFileIds"],
+    "skill": ["contextFileIds"],
+    "other": [],
+}
+
+
+def claim_staged_files(body, asset_type, update_request=None):
+    """Resolve uploaded-but-unclaimed files named in a submission.
+
+    Returns the ``AssetFile`` rows, having set each one's ``kind``. The caller
+    binds them to whatever now owns them. Ids that are unknown, already
+    claimed, or not permitted for this asset type are rejected rather than
+    silently ignored — a submission that quietly loses its attachments is
+    worse than one that fails.
+    """
+    allowed_fields = TYPE_FILE_FIELDS.get(asset_type, [])
+    claimed = []
+    errors = {}
+    maximum = current_app.config.get("MAX_FILES_PER_ASSET", 25)
+
+    for field, kind in FILE_FIELD_TO_KIND.items():
+        raw = body.get(field)
+        if not raw:
+            continue
+        if field not in allowed_fields:
+            errors[field] = "This asset type does not take these files."
+            continue
+        if not isinstance(raw, list):
+            errors[field] = "Expected a list of uploaded file ids."
+            continue
+        if len(raw) > maximum:
+            errors[field] = "At most {0} files.".format(maximum)
+            continue
+        for file_id in raw:
+            try:
+                stored = db.session.get(AssetFile, int(file_id))
+            except (TypeError, ValueError):
+                stored = None
+            if stored is None or not stored.is_staged:
+                errors[field] = "One of those uploads has expired — re-attach it."
+                continue
+            stored.kind = kind
+            if update_request is not None:
+                stored.update_request_id = update_request.id
+            claimed.append(stored)
+
+    if errors:
+        raise ValidationError("Some attachments could not be applied.", errors)
+    return claimed
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +229,11 @@ def configuration_instructions(config: Dict[str, Any]) -> str:
     return ""
 
 
+def _actor_name(actor) -> str:
+    """Display name recorded on a version entry for an admin action."""
+    return (getattr(actor, "full_name", None) or "Admin")
+
+
 def bump_version(current: str) -> str:
     """The prototype's +0.1 rule, made robust against odd inputs."""
     try:
@@ -217,21 +287,17 @@ def _visible_status_filter(query, requested_status: Optional[str]):
     """Apply the governance rule: the catalogue shows Approved assets only.
 
     Anything else is restricted to reviewers/admins, or to the asset's own
-    creator/owner via /api/my-submissions. This is the IDOR guard for the list
-    endpoint — a plain user cannot page through pending submissions by adding
-    ``?status=Pending Review``.
+    This is the IDOR guard for the list endpoint — an anonymous visitor cannot
+    page through pending submissions by adding ``?status=Pending Review``.
     """
-    viewer = current_user_or_none()
-    is_reviewer = bool(viewer and viewer.has_role(reference.ROLE_REVIEWER))
-
-    if not is_reviewer:
-        # A non-reviewer never sees anything but the published catalogue, no
-        # matter what ?status= they send.
+    if not is_admin():
+        # Without the admin password the caller never sees anything but the
+        # published catalogue, no matter what ?status= they send.
         return query.filter(Asset.status == reference.STATUS_APPROVED)
 
     if not requested_status:
-        # Default to the catalogue even for reviewers, so the Library view and
-        # the Admin view cannot be confused by whoever happens to be signed in.
+        # Default to the catalogue even for an admin, so the Library view and
+        # the Admin view cannot be confused by whether the console is unlocked.
         return query.filter(Asset.status == reference.STATUS_APPROVED)
     if requested_status.lower() == "all":
         return query
@@ -361,7 +427,6 @@ def get_asset(asset_id: int):
 
 
 @bp.route("/api/assets/next-code", methods=["GET"])
-@login_required_json
 def next_code():
     """Preview only — the authoritative code is allocated at insert time."""
     department = (request.args.get("department") or "").strip()
@@ -373,7 +438,6 @@ def next_code():
 
 
 @bp.route("/api/assets/duplicate-check", methods=["GET"])
-@login_required_json
 def duplicate_check():
     """Server-side port of the prototype's findPossibleDuplicates().
 
@@ -435,13 +499,17 @@ def _normalise_name(name: str) -> str:
 # create / update
 # ---------------------------------------------------------------------------
 @bp.route("/api/assets", methods=["POST"])
-@login_required_json
 @_rate_limit_write
 def create_asset():
-    data = validate_asset_submission(_json_body(), editing=False)
-    actor = current_user._get_current_object()
+    """Submit a new asset. Open to anyone, like the prototype's wizard."""
+    body = _json_body()
+    data = validate_asset_submission(body, editing=False)
     department = data["department"]
     now = utcnow()
+
+    # Files were uploaded ahead of this call and are sitting unclaimed; bind
+    # them to the asset inside the same transaction that creates it.
+    staged = claim_staged_files(body, data["type"])
 
     def _insert(code: str) -> Asset:
         asset = Asset(
@@ -457,19 +525,17 @@ def create_asset():
             input_requirements=data.get("inputRequirements"),
             expected_output=data.get("expectedOutput"),
             example_use=data.get("exampleUse"),
-            owner_id=actor.id,
-            creator_id=actor.id,
             owner_name=data["ownerName"],
             owner_email=data["ownerEmail"],
             creator_name=data["ownerName"],
-            submitted_by_name=actor.full_name or data["ownerName"],
+            submitted_by_name=data["ownerName"],
             intended_audience=data.get("intendedAudience") or "Company-wide",
             access_level=data.get("intendedAudience") or "Company-wide",
             sensitivity=data.get("sensitivity") or "Standard Internal",
             review_frequency=data.get("reviewFrequency") or "Every 6 months",
             current_version="1.0",
             direct_url=data["link"],
-            featured=False,          # only a reviewer may feature an asset
+            featured=False,          # only an admin may feature an asset
             configuration=build_configuration(data["type"], data),
             additional_departments=[],
             created_at=now,
@@ -481,30 +547,34 @@ def create_asset():
         asset.next_review_date = asset.compute_next_review()
         db.session.add(asset)
         db.session.flush()
+        for stored in staged:
+            stored.asset_id = asset.id
         add_version(asset, "1.0", "Initial submission, pending governance review.",
-                    data["ownerName"], actor, make_current=True)
-        audit.record(audit.ASSET_SUBMIT, asset,
-                     {"department": department, "type": data["type"]}, actor=actor)
+                    data["ownerName"], None, make_current=True)
+        audit.record(audit.ASSET_SUBMIT, asset, {
+            "department": department, "type": data["type"],
+            "submittedBy": data["ownerName"], "submittedEmail": data["ownerEmail"],
+            "files": len(staged),
+        })
         return asset
 
     asset = wgt.allocate_with_retry(department, _insert)
-    log.info("Asset %s submitted by %s", asset.wgt_code, actor.email)
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor)}, 201)
+    log.info("Asset %s submitted by %s <%s> from %s", asset.wgt_code,
+             data["ownerName"], data["ownerEmail"], request.remote_addr)
+    return ok({"asset": asset.to_dict(include_detail=True)}, 201)
 
 
 @bp.route("/api/assets/<int:asset_id>", methods=["PUT", "PATCH"])
-@login_required_json
+@admin_required
 @_rate_limit_write
 def update_asset(asset_id: int):
     asset = db.session.get(Asset, asset_id)
     if asset is None:
         raise NotFound("That asset could not be found.")
-    assert_can_view_asset(asset)
-    assert_can_edit_asset(asset)
 
     body = _json_body()
     data = validate_asset_submission(body, editing=True)
-    actor = current_user._get_current_object()
+    actor = current_user_or_none()
 
     # Immutable fields. Silently ignoring an attempt would hide a real client
     # bug, so say so plainly instead.
@@ -523,7 +593,6 @@ def update_asset(asset_id: int):
         raise Conflict("An asset's type cannot be changed after submission.",
                        code="IMMUTABLE_FIELD", fields={"type": "Type is fixed."})
 
-    is_reviewer = actor.has_role(reference.ROLE_REVIEWER)
     changed: Dict[str, Any] = {}
 
     def _apply(field: str, value: Any, attr: str) -> None:
@@ -553,14 +622,10 @@ def update_asset(asset_id: int):
         if sorted(asset.tag_names) != before:
             changed["tags"] = True
 
-    # Only a reviewer/admin may promote an asset onto the Featured rail.
+    # Reaching this route already required the admin password.
     if "featured" in body:
         wanted = bool(data.get("featured"))
         if wanted != bool(asset.featured):
-            if not is_reviewer:
-                raise ApiError("FORBIDDEN",
-                               "Only a reviewer or administrator can feature an asset.",
-                               403, {"featured": "Not permitted."})
             asset.featured = wanted
             changed["featured"] = True
 
@@ -569,33 +634,32 @@ def update_asset(asset_id: int):
     asset.last_updated_at = utcnow()
     asset.next_review_date = asset.compute_next_review()
 
+    # Newly attached files, if the edit form added any.
+    for stored in claim_staged_files(body, asset.asset_type):
+        stored.asset_id = asset.id
+        changed["files"] = True
+
     summary = (body.get("changeSummary") or "").strip()[:2000]
     if not summary:
-        summary = ("Edited by {0}.".format("an admin" if is_reviewer else "the owner"))
+        summary = "Edited by an admin."
     add_version(asset, bump_version(asset.current_version), summary,
-                actor.full_name or data["ownerName"], actor, make_current=True)
+                _actor_name(actor), actor, make_current=True)
 
     audit.record(audit.ASSET_UPDATE, asset,
                  {"fields": sorted(changed.keys()), "status": asset.status}, actor=actor)
     db.session.commit()
-    log.info("Asset %s updated by %s", asset.wgt_code, actor.email)
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor)})
+    log.info("Asset %s updated from %s", asset.wgt_code, request.remote_addr)
+    return ok({"asset": asset.to_dict(include_detail=True, )})
 
 
 @bp.route("/api/assets/<int:asset_id>/versions", methods=["POST"])
-@login_required_json
+@admin_required
 @_rate_limit_write
 def create_version(asset_id: int):
     asset = db.session.get(Asset, asset_id)
     if asset is None:
         raise NotFound("That asset could not be found.")
-    assert_can_view_asset(asset)
-    actor = current_user._get_current_object()
-    # Reviewers may version anything; owners only their own asset.
-    if not (actor.has_role(reference.ROLE_REVIEWER)
-            or asset.owner_id == actor.id or asset.creator_id == actor.id):
-        from app.errors import Forbidden
-        raise Forbidden("Only the asset's owner or a reviewer can add a version.")
+    actor = current_user_or_none()
 
     data = validate_version_payload(_json_body())
     if any(v.version_number == data["versionNumber"] for v in asset.versions):
@@ -604,13 +668,13 @@ def create_version(asset_id: int):
                        fields={"versionNumber": "Already used — pick another."})
 
     version = add_version(asset, data["versionNumber"], data["summary"],
-                          data.get("updatedBy") or actor.full_name, actor,
+                          data.get("updatedBy") or _actor_name(actor), actor,
                           make_current=True)
     asset.last_updated_at = utcnow()
     audit.record(audit.VERSION_CREATE, asset,
                  {"version": version.version_number}, actor=actor)
     db.session.commit()
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor),
+    return ok({"asset": asset.to_dict(include_detail=True),
                "version": version.to_dict()}, 201)
 
 
@@ -625,7 +689,7 @@ def _load_for_review(asset_id: int) -> Asset:
 
 
 @bp.route("/api/assets/<int:asset_id>/approve", methods=["POST"])
-@reviewer_required
+@admin_required
 @_rate_limit_write
 def approve_asset(asset_id: int):
     asset = _load_for_review(asset_id)
@@ -635,7 +699,7 @@ def approve_asset(asset_id: int):
         raise Conflict("Restore the asset from the archive before approving it.",
                        code="INVALID_TRANSITION")
 
-    actor = current_user._get_current_object()
+    actor = current_user_or_none()
     now = utcnow()
     asset.status = reference.STATUS_APPROVED
     asset.rejection_reason = None
@@ -645,15 +709,15 @@ def approve_asset(asset_id: int):
     asset.next_review_date = asset.compute_next_review()
     add_version(asset, bump_version(asset.current_version),
                 "Approved by governance review — published to the Library.",
-                actor.full_name or "Reviewer", actor, make_current=True)
+                _actor_name(actor), actor, make_current=True)
     audit.record(audit.ASSET_APPROVE, asset, {"version": asset.current_version}, actor=actor)
     db.session.commit()
-    log.info("Asset %s approved by %s", asset.wgt_code, actor.email)
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor)})
+    log.info("Asset %s approved from %s", asset.wgt_code, request.remote_addr)
+    return ok({"asset": asset.to_dict(include_detail=True, )})
 
 
 @bp.route("/api/assets/<int:asset_id>/reject", methods=["POST"])
-@reviewer_required
+@admin_required
 @_rate_limit_write
 def reject_asset(asset_id: int):
     asset = _load_for_review(asset_id)
@@ -664,21 +728,21 @@ def reject_asset(asset_id: int):
     reason = validator.string("reason", "Reason", required=False, max_length=2000)
     validator.raise_if_invalid()
 
-    actor = current_user._get_current_object()
+    actor = current_user_or_none()
     asset.status = reference.STATUS_REJECTED
     asset.rejection_reason = reason or None
     asset.last_updated_at = utcnow()
     add_version(asset, bump_version(asset.current_version),
                 "Rejected by governance review." + (" " + reason if reason else ""),
-                actor.full_name or "Reviewer", actor, make_current=True)
+                _actor_name(actor), actor, make_current=True)
     audit.record(audit.ASSET_REJECT, asset, {"reason": reason or ""}, actor=actor)
     db.session.commit()
-    log.info("Asset %s rejected by %s", asset.wgt_code, actor.email)
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor)})
+    log.info("Asset %s rejected from %s", asset.wgt_code, request.remote_addr)
+    return ok({"asset": asset.to_dict(include_detail=True, )})
 
 
 @bp.route("/api/assets/<int:asset_id>/archive", methods=["POST"])
-@reviewer_required
+@admin_required
 @_rate_limit_write
 def archive_asset(asset_id: int):
     """"Remove from Library" — hides the asset but keeps the record and history."""
@@ -690,55 +754,16 @@ def archive_asset(asset_id: int):
     reason = validator.string("reason", "Reason", required=False, max_length=2000)
     validator.raise_if_invalid()
 
-    actor = current_user._get_current_object()
+    actor = current_user_or_none()
     previous = asset.status
     asset.status = reference.STATUS_ARCHIVED
     asset.featured = False
     asset.last_updated_at = utcnow()
     add_version(asset, bump_version(asset.current_version),
                 "Removed from the Library by an admin." + (" " + reason if reason else ""),
-                actor.full_name or "Admin", actor, make_current=True)
+                _actor_name(actor), actor, make_current=True)
     audit.record(audit.ASSET_ARCHIVE, asset,
                  {"from": previous, "reason": reason or ""}, actor=actor)
     db.session.commit()
-    log.info("Asset %s archived by %s", asset.wgt_code, actor.email)
-    return ok({"asset": asset.to_dict(include_detail=True, viewer=actor)})
-
-
-# ---------------------------------------------------------------------------
-# my submissions
-# ---------------------------------------------------------------------------
-@bp.route("/api/my-submissions", methods=["GET"])
-@login_required_json
-def my_submissions():
-    """Everything the signed-in user submitted or owns, bucketed by status."""
-    actor = current_user._get_current_object()
-    query = (_base_query()
-             .filter(or_(Asset.creator_id == actor.id, Asset.owner_id == actor.id))
-             .order_by(Asset.last_updated_at.desc()))
-
-    term = (request.args.get("q") or "").strip()[:200]
-    if term:
-        query = _apply_search(query, term)
-
-    page, per_page = _pagination_args()
-    total = query.order_by(None).count()
-    rows = query.limit(per_page).offset((page - 1) * per_page).all()
-
-    buckets: Dict[str, List[Dict[str, Any]]] = {status: [] for status in reference.STATUSES}
-    items = []
-    for asset in rows:
-        payload = asset.to_dict()
-        payload["canEdit"] = asset.viewer_can_edit(actor)
-        items.append(payload)
-        buckets.setdefault(asset.status, []).append(payload)
-
-    return ok({
-        "items": items,
-        "buckets": buckets,
-        "counts": {status: len(entries) for status, entries in buckets.items()},
-        "total": total,
-        "page": page,
-        "perPage": per_page,
-        "pages": (total + per_page - 1) // per_page if per_page else 0,
-    })
+    log.info("Asset %s archived from %s", asset.wgt_code, request.remote_addr)
+    return ok({"asset": asset.to_dict(include_detail=True, )})

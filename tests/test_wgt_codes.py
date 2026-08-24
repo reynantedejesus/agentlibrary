@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app import reference, wgt
 from app.extensions import db
 from app.models import Asset, WgtCounter
-from tests.conftest import asset_payload, create_asset, data, err
+from tests.conftest import asset_payload, create_asset, data, err, unlock
 
 
 def test_department_digit_follows_the_numbering_order(app):
@@ -47,26 +47,26 @@ def test_prefix_ambiguity_is_resolved(app, code, digit, expected):
     assert wgt._parse_sequence(code, digit) == expected
 
 
-def test_sequential_codes_increment_within_a_department(as_user):
-    first = create_asset(as_user, name="One")
-    second = create_asset(as_user, name="Two")
-    third = create_asset(as_user, name="Three")
+def test_sequential_codes_increment_within_a_department(client):
+    first = create_asset(client, name="One")
+    second = create_asset(client, name="Two")
+    third = create_asset(client, name="Three")
     assert [first["wgtCode"], second["wgtCode"], third["wgtCode"]] == \
         ["WGT201", "WGT202", "WGT203"]
 
 
-def test_departments_have_independent_sequences(as_user):
-    finance = create_asset(as_user, name="Finance One", department="Finance")
-    sales = create_asset(as_user, name="Sales One", department="Sales")
-    finance_two = create_asset(as_user, name="Finance Two", department="Finance")
+def test_departments_have_independent_sequences(client):
+    finance = create_asset(client, name="Finance One", department="Finance")
+    sales = create_asset(client, name="Sales One", department="Sales")
+    finance_two = create_asset(client, name="Finance Two", department="Finance")
     assert finance["wgtCode"] == "WGT201"
     assert sales["wgtCode"] == "WGT101"
     assert finance_two["wgtCode"] == "WGT202"
 
 
-def test_wgt_code_has_a_unique_database_constraint(app, as_user):
+def test_wgt_code_has_a_unique_database_constraint(app, client):
     """The constraint is the backstop behind the counter."""
-    asset = create_asset(as_user)
+    asset = create_asset(client)
     duplicate = Asset(
         wgt_code=asset["wgtCode"],            # deliberate collision
         name="Collision", asset_type="gpt", platform="ChatGPT",
@@ -82,9 +82,9 @@ def test_wgt_code_has_a_unique_database_constraint(app, as_user):
     assert Asset.query.filter_by(wgt_code=asset["wgtCode"]).count() == 1
 
 
-def test_allocation_retries_past_an_imported_collision(app, as_user):
+def test_allocation_retries_past_an_imported_collision(app, client):
     """A code inserted outside the counter must not be handed out again."""
-    create_asset(as_user, name="First")                  # WGT201
+    create_asset(client, name="First")                  # WGT201
     # Simulate a legacy import that claimed WGT202 without touching the counter.
     legacy = Asset(
         wgt_code="WGT202", name="Legacy Import", asset_type="gpt",
@@ -99,7 +99,7 @@ def test_allocation_retries_past_an_imported_collision(app, as_user):
     counter.last_sequence = 1                            # deliberately stale
     db.session.commit()
 
-    third = create_asset(as_user, name="Third")
+    third = create_asset(client, name="Third")
     assert third["wgtCode"] == "WGT203"                  # skipped the taken code
     assert Asset.query.filter_by(wgt_code="WGT202").count() == 1
 
@@ -119,8 +119,6 @@ def test_concurrent_allocation_produces_no_duplicates(app, upload_dir):
 
     from app import create_app
     from app.config import TestingConfig
-    from app.models import User
-    from tests.conftest import PASSWORD, login
 
     db_path = os.path.join(tempfile.mkdtemp(), "concurrent.db")
     url = "sqlite:///" + db_path
@@ -139,10 +137,6 @@ def test_concurrent_allocation_produces_no_duplicates(app, upload_dir):
         maker.config.update(UPLOAD_DIR=upload_dir, WTF_CSRF_ENABLED=False)
         with maker.app_context():
             db.create_all()
-            user = User(email="racer@wings.test", full_name="Racer", role="user")
-            user.set_password(PASSWORD)
-            db.session.add(user)
-            db.session.commit()
             wgt.ensure_counter_rows()
 
         codes = []
@@ -156,11 +150,6 @@ def test_concurrent_allocation_produces_no_duplicates(app, upload_dir):
                 worker.config.update(UPLOAD_DIR=upload_dir, WTF_CSRF_ENABLED=False)
                 with worker.app_context():
                     client = worker.test_client()
-                    signin = login(client, "racer@wings.test", PASSWORD)
-                    if signin.status_code != 200:
-                        with lock:
-                            errors.append(("login", signin.status_code, signin.get_json()))
-                        return
                     start_line.wait(timeout=30)   # all four submit at once
                     for step in range(3):
                         response = client.post("/api/assets", json=asset_payload(
@@ -198,25 +187,24 @@ def test_concurrent_allocation_produces_no_duplicates(app, upload_dir):
         TestingConfig.SQLALCHEMY_ENGINE_OPTIONS = original_options
 
 
-def test_preview_is_not_a_reservation(as_user):
-    first = data(as_user.get("/api/assets/next-code?department=Finance"))["preview"]
-    second = data(as_user.get("/api/assets/next-code?department=Finance"))["preview"]
+def test_preview_is_not_a_reservation(client):
+    first = data(client.get("/api/assets/next-code?department=Finance"))["preview"]
+    second = data(client.get("/api/assets/next-code?department=Finance"))["preview"]
     assert first == second == "WGT201"
-    assert data(as_user.get("/api/assets/next-code?department=Finance"))["authoritative"] is False
+    assert data(client.get("/api/assets/next-code?department=Finance"))["authoritative"] is False
 
 
-def test_preview_rejects_an_unknown_department(as_user):
-    response = as_user.get("/api/assets/next-code?department=Atlantis")
+def test_preview_rejects_an_unknown_department(client):
+    response = client.get("/api/assets/next-code?department=Atlantis")
     assert response.status_code == 400
     assert "department" in err(response)["fields"]
 
 
-def test_admin_department_migration_mints_a_new_code(app, as_user, admin_user):
-    from tests.conftest import login
-    asset = create_asset(as_user, department="Finance")
+def test_admin_department_migration_mints_a_new_code(app, client, admin_user):
+    asset = create_asset(client, department="Finance")
     assert asset["wgtCode"] == "WGT201"
     admin = app.test_client()
-    login(admin, admin_user.email)
+    unlock(admin)
     payload = data(admin.post("/api/admin/assets/%d/migrate-department" % asset["id"],
                               json={"department": "Tech", "reason": "Team moved."}))
     assert payload["previousCode"] == "WGT201"
@@ -224,33 +212,29 @@ def test_admin_department_migration_mints_a_new_code(app, as_user, admin_user):
     assert payload["asset"]["department"] == "Tech"
 
 
-def test_department_migration_is_admin_only(app, as_user, reviewer_user):
-    from tests.conftest import login
-    asset = create_asset(as_user)
-    reviewer = app.test_client()
-    login(reviewer, reviewer_user.email)
-    response = reviewer.post("/api/admin/assets/%d/migrate-department" % asset["id"],
-                             json={"department": "Tech", "reason": "why not"})
-    assert response.status_code == 403
+def test_department_migration_needs_the_password(app, client, admin_user):
+    asset = create_asset(client)
+    locked = app.test_client()
+    response = locked.post("/api/admin/assets/%d/migrate-department" % asset["id"],
+                           json={"department": "Tech", "reason": "why not"})
+    assert response.status_code == 401
 
 
-def test_department_migration_requires_a_reason(app, as_user, admin_user):
-    from tests.conftest import login
-    asset = create_asset(as_user)
+def test_department_migration_requires_a_reason(app, client, admin_user):
+    asset = create_asset(client)
     admin = app.test_client()
-    login(admin, admin_user.email)
+    unlock(admin)
     response = admin.post("/api/admin/assets/%d/migrate-department" % asset["id"],
                           json={"department": "Tech"})
     assert response.status_code == 400
     assert "reason" in err(response)["fields"]
 
 
-def test_department_migration_is_audited(app, as_user, admin_user):
-    from tests.conftest import login
+def test_department_migration_is_audited(app, client, admin_user):
     from app.models import ActivityLog
-    asset = create_asset(as_user)
+    asset = create_asset(client)
     admin = app.test_client()
-    login(admin, admin_user.email)
+    unlock(admin)
     admin.post("/api/admin/assets/%d/migrate-department" % asset["id"],
                json={"department": "Tech", "reason": "Team moved."})
     entry = ActivityLog.query.filter_by(action="asset.department_migrate").one()

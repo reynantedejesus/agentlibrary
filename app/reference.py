@@ -23,8 +23,8 @@ ASSET_TYPES = [
         "colorClass": "type-gpt", "railClass": "tl-gpt",
     },
     {
-        "id": "skill", "label": "Claude Skill", "short": "Claude", "platform": "Claude",
-        "blurb": "A packaged SKILL.md that extends what Claude can do.",
+        "id": "skill", "label": "Claude Skill / Project", "short": "Claude", "platform": "Claude",
+        "blurb": "A packaged SKILL.md, or a Claude Project, that extends what Claude can do.",
         "colorClass": "type-skill", "railClass": "tl-skill",
     },
     {
@@ -75,10 +75,13 @@ SENSITIVITY = ["Standard Internal", "Confidential", "Restricted"]
 REVIEW_FREQUENCY = ["Monthly", "Quarterly", "Every 6 months", "Annually", "No scheduled review"]
 REVIEW_FREQUENCY_MONTHS = {"Monthly": 1, "Quarterly": 3, "Every 6 months": 6, "Annually": 12}
 
+# No "org default" entry: a blank preferred model means "no preference, let the
+# user decide", and the wizard never auto-picks one.
 RECOMMENDED_MODELS = [
-    "Org default (recommended)", "Fast / low-cost tier", "Balanced tier",
+    "Fast / low-cost tier", "Balanced tier",
     "Highest-capability tier", "Legacy / pinned version",
 ]
+NO_PREFERRED_MODEL_LABEL = "No preferred model (allow user to decide)"
 
 GPT_CAPABILITIES = ["Web Search", "Image Generation", "Canvas",
                     "Code Interpreter / Data Analysis", "Other"]
@@ -97,8 +100,12 @@ FILE_KINDS = {
         "desc": "The packaged, installable tool itself (e.g. a Skill ZIP).",
     },
     "knowledge": {
-        "label": "Knowledge / resource",
-        "desc": "Reference material, templates, knowledge files used by the asset.",
+        "label": "Knowledge Base",
+        "desc": "Reference material and knowledge files the asset was given.",
+    },
+    "context": {
+        "label": "Context",
+        "desc": "Files a Claude Skill or Project was given as context.",
     },
     "documentation": {
         "label": "Documentation",
@@ -112,6 +119,92 @@ FILE_TYPE_ICONS = {
     "json": "JSON", "yaml": "YML", "yml": "YML", "csv": "CSV", "xlsx": "XLS",
     "png": "IMG", "jpg": "IMG", "jpeg": "IMG", "other": "FILE",
 }
+
+UPDATE_STATUS_OPEN = "Open"
+UPDATE_STATUS_ACCEPTED = "Accepted"
+UPDATE_STATUS_DECLINED = "Declined"
+UPDATE_REQUEST_STATUSES = [UPDATE_STATUS_OPEN, UPDATE_STATUS_ACCEPTED,
+                           UPDATE_STATUS_DECLINED]
+
+# Every field an Update Request may propose a new value for. Ids are unique
+# across asset types so one flat label map serves the admin view regardless of
+# what kind of asset a request targets.
+UPDATE_REQUEST_FIELD_LABELS = {
+    "name": "Name",
+    "description": "Description",
+    "instructions": "Instructions / Prompt",
+    "link": "Link to the artifact",
+    "tags": "Tags",
+    "owner": "Creator / Owner details",
+    "knowledgeBase": "Knowledge Base",
+    "context": "Context",
+    "preferredModel": "Preferred Model",
+    "otherPlatform": "What tool is this",
+}
+
+# Fields offered to every asset type.
+_UPDATE_FIELDS_BASE = [
+    {"id": "name", "label": "Name", "promptLabel": "New Name", "kind": "text",
+     "placeholder": "New name for this tool"},
+    {"id": "description", "label": "Description",
+     "promptLabel": "Latest description", "kind": "textarea"},
+    {"id": "instructions", "label": "Instructions / Prompt",
+     "promptLabel": "Latest instructions / prompt", "kind": "textarea"},
+    {"id": "link", "label": "Link to the artifact", "promptLabel": "New link",
+     "kind": "text", "placeholder": "https://..."},
+    {"id": "tags", "label": "Tags", "promptLabel": "Latest tags", "kind": "text",
+     "placeholder": "e.g. Writing, Reporting, Analysis",
+     "hint": "Comma-separated \u2014 replaces the current tags."},
+    {"id": "owner", "label": "Creator / Owner details", "kind": "owner"},
+]
+
+# Per-type extras. "files" fields store their uploads against the request via
+# asset_files.update_request_id rather than in the JSON payload.
+_UPDATE_FIELDS_BY_TYPE = {
+    "gpt": [
+        {"id": "knowledgeBase", "label": "Knowledge Base",
+         "promptLabel": "Latest knowledge base files", "kind": "files",
+         "filesKey": "knowledgeFiles"},
+        {"id": "preferredModel", "label": "Preferred Model",
+         "promptLabel": "Preferred model", "kind": "select"},
+    ],
+    "skill": [
+        {"id": "context", "label": "Context",
+         "promptLabel": "Latest context files", "kind": "files",
+         "filesKey": "contextFiles"},
+    ],
+    "agent": [
+        {"id": "knowledgeBase", "label": "Knowledge Base",
+         "promptLabel": "Latest knowledge base files", "kind": "files",
+         "filesKey": "knowledgeFiles"},
+    ],
+    "other": [
+        {"id": "otherPlatform", "label": "What tool is this",
+         "promptLabel": "What tool is this now?", "kind": "text",
+         "placeholder": "e.g. n8n, Zapier, an internal PowerApp"},
+    ],
+}
+
+
+def update_request_field_options(asset_type):
+    """Fields a requester may propose changes to, for one asset type."""
+    import copy
+    options = copy.deepcopy(_UPDATE_FIELDS_BASE)
+    for extra in copy.deepcopy(_UPDATE_FIELDS_BY_TYPE.get(asset_type, [])):
+        if extra.get("kind") == "select" and extra["id"] == "preferredModel":
+            extra["options"] = [""] + list(RECOMMENDED_MODELS)
+            extra["optionLabels"] = {"": NO_PREFERRED_MODEL_LABEL}
+        options.append(extra)
+    return options
+
+
+def update_request_field_ids(asset_type):
+    return [option["id"] for option in update_request_field_options(asset_type)]
+
+
+def update_field_label(field_id):
+    return UPDATE_REQUEST_FIELD_LABELS.get(field_id, field_id)
+
 
 ROLE_USER = "user"
 ROLE_REVIEWER = "reviewer"
@@ -148,6 +241,9 @@ _DEFAULTS: Dict[str, Any] = {
     "fileKinds": FILE_KINDS,
     "fileTypeIcons": FILE_TYPE_ICONS,
     "roles": ROLES,
+    "updateRequestStatuses": UPDATE_REQUEST_STATUSES,
+    "updateRequestFieldLabels": UPDATE_REQUEST_FIELD_LABELS,
+    "noPreferredModelLabel": NO_PREFERRED_MODEL_LABEL,
 }
 
 
