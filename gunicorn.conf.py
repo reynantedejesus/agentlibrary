@@ -11,12 +11,19 @@ production without edits — the values come from
 
 Binding
 -------
-The default is a Unix socket in ``/run/agentlibrary``. Gunicorn NEVER binds to
-0.0.0.0 here: nginx is the only thing that talks to it. If you must use TCP,
-set ``GUNICORN_BIND=127.0.0.1:8000`` — loopback only. A public bind is refused
-at startup (see the assertion below), because that would expose the app
-without TLS, without the security headers nginx adds, and without the request
-size limit.
+The default is the loopback port ``127.0.0.1:8090``, which is what the shipped
+nginx config proxies to. Gunicorn NEVER binds to 0.0.0.0 here: nginx is the
+only thing that talks to it. A public bind is refused at startup (see the
+check below), because that would expose the app without TLS, without the
+security headers nginx adds, and without the request size limit.
+
+A Unix socket still works if you prefer it — set
+``GUNICORN_BIND=unix:/run/agentlibrary/agentlibrary.sock`` and point the nginx
+``upstream`` at the same path. The unit already creates ``/run/agentlibrary``
+via ``RuntimeDirectory=``.
+
+Do not open the bind port in firewalld. It is reachable from the host only,
+and nginx is the only client.
 """
 from __future__ import annotations
 
@@ -45,16 +52,18 @@ def _int(name, default):
         return default
 
 
-# --- socket ------------------------------------------------------------------
-bind = os.environ.get("GUNICORN_BIND", "unix:/run/agentlibrary/agentlibrary.sock")
+# --- bind --------------------------------------------------------------------
+bind = os.environ.get("GUNICORN_BIND", "127.0.0.1:8090")
 
 # Refuse to start on a public interface. This is a deployment mistake that is
 # easy to make and expensive to notice, so fail loudly instead of serving.
-_host = bind.split("//")[-1].split(":")[0]
-if not bind.startswith("unix:") and _host not in ("127.0.0.1", "localhost", "::1"):
+# unix: and fd: binds are not network binds at all, so they are exempt.
+_is_local_socket = bind.startswith("unix:") or bind.startswith("fd://")
+_host = bind.rsplit(":", 1)[0].strip("[]") if ":" in bind else bind
+if not _is_local_socket and _host not in ("127.0.0.1", "localhost", "::1"):
     raise RuntimeError(
-        "Refusing to bind gunicorn to %r. Bind to a Unix socket or 127.0.0.1 "
-        "and let nginx terminate TLS in front of it." % bind
+        "Refusing to bind gunicorn to %r. Bind to 127.0.0.1, a Unix socket or "
+        "fd://, and let nginx terminate TLS in front of it." % bind
     )
 
 if bind.startswith("unix:"):
@@ -68,8 +77,8 @@ if bind.startswith("unix:"):
             "nothing extra.\n"
             "  To run gunicorn by hand, either create the directory:\n"
             "      sudo mkdir -p {1} && sudo chown agentlibrary:agentlibrary {1}\n"
-            "  or bind a loopback port instead:\n"
-            "      GUNICORN_BIND=127.0.0.1:8000 gunicorn -c gunicorn.conf.py "
+            "  or use the loopback bind, which needs no directory:\n"
+            "      GUNICORN_BIND=127.0.0.1:8090 gunicorn -c gunicorn.conf.py "
             "wsgi:application".format(bind, _socket_dir)
         )
     if not os.access(_socket_dir, os.W_OK):
@@ -79,9 +88,9 @@ if bind.startswith("unix:"):
             "gunicorn.conf.py wsgi:application".format(_socket_dir, os.getuid())
         )
 
-# Socket permissions: nginx must be able to connect. 0o660 with the socket
+# Only relevant when GUNICORN_BIND names a Unix socket: 0o660 with the socket
 # owned by the agentlibrary user and group, plus nginx added to that group,
-# keeps the socket unreadable by everyone else.
+# keeps it unreadable by everyone else. Harmless on a TCP bind.
 umask = 0o007
 backlog = 2048
 

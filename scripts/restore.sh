@@ -12,6 +12,9 @@ set -euo pipefail
 BACKUP_DIR="${1:?Usage: restore.sh /path/to/backup-directory}"
 ENV_FILE="${ENV_FILE:-/etc/agentlibrary/agentlibrary.env}"
 APP_DIR="${APP_DIR:-/var/www/agentlibrary}"
+# Matches GUNICORN_BIND. For a Unix socket, override with e.g.
+#   HEALTH_URL="--unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8090/health}"
 
 log() { printf '%s  %s\n' "$(date --iso-8601=seconds)" "$*"; }
 fail() { log "ERROR: $*" >&2; exit 1; }
@@ -85,7 +88,6 @@ sleep 3
 systemctl is-active --quiet agentlibrary || fail "Service did not come back up — check journalctl -u agentlibrary"
 
 log "Health check"
-curl -fsS --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health \
-    || fail "Health check failed"
+curl -fsS "${HEALTH_URL}" || fail "Health check failed"
 echo
 log "Restore complete. Safety dump kept at ${SAFETY}"

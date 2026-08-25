@@ -1,7 +1,7 @@
 # /etc/systemd/system/agentlibrary.service
 #
-# Runs gunicorn under a dedicated non-root account, on a Unix socket that only
-# nginx can reach. Install with:
+# Runs gunicorn under a dedicated non-root account, on the loopback address
+# only (127.0.0.1:8090 by default) with nginx proxying to it. Install with:
 #
 #   sudo install -m 0644 deploy/agentlibrary.service /etc/systemd/system/
 #   sudo install -m 0644 deploy/agentlibrary.socket  /etc/systemd/system/   # optional
@@ -24,8 +24,9 @@ Wants=network-online.target
 Type=notify
 User=agentlibrary
 Group=agentlibrary
-# nginx runs as its own user; adding it to the agentlibrary group lets it
-# connect to the 0660 socket without opening it to the world.
+# Only matters if GUNICORN_BIND is switched to a Unix socket: nginx runs as
+# its own user, and adding it to the agentlibrary group lets it connect to the
+# 0660 socket without opening it to the world.
 UMask=0007
 
 WorkingDirectory=/var/www/agentlibrary
@@ -37,8 +38,9 @@ Environment="PATH=/var/www/agentlibrary/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 
-# /run/agentlibrary is created on every start and removed on stop, so a stale
-# socket can never linger after a crash.
+# /run/agentlibrary is created on every start and removed on stop. Unused on
+# the default TCP bind, but it means switching GUNICORN_BIND to a Unix socket
+# needs no other change — and no stale socket can linger after a crash.
 RuntimeDirectory=agentlibrary
 RuntimeDirectoryMode=0750
 StateDirectory=agentlibrary
@@ -84,6 +86,7 @@ ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
+# AF_INET is required for the loopback bind (and for MySQL over TCP).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 MemoryDenyWriteExecute=false

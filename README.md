@@ -499,8 +499,9 @@ sudo systemctl status agentlibrary
 The unit:
 
 * runs as **`agentlibrary`**, never root (`User=` / `Group=`);
-* binds a **Unix socket** in `/run/agentlibrary` (`RuntimeDirectory=` creates it
-  at start and removes it at stop, so a stale socket can never linger);
+* binds **127.0.0.1:8090** — loopback only, so nothing off the host can reach
+  gunicorn directly (`RuntimeDirectory=` still creates `/run/agentlibrary`, so
+  switching `GUNICORN_BIND` to a Unix socket needs no other change);
 * reads secrets from `EnvironmentFile=/etc/agentlibrary/agentlibrary.env`;
 * `Restart=always` with `RestartSec=5` and a start-limit so a bad config does
   not spin forever;
@@ -551,7 +552,7 @@ The configuration:
 * listens on **80 and 443**; :80 serves only the ACME challenge and the health
   check and **redirects everything else to HTTPS** (before TLS exists, comment
   out the redirect and uncomment the proxy block, both marked in the file);
-* proxies to the gunicorn Unix socket via an `upstream` with keepalive;
+* proxies to gunicorn on **127.0.0.1:8090** via an `upstream` with keepalive;
 * serves **only `/static/`** from disk, with execution of `.php/.py/.sh` denied
   and dotfiles blocked;
 * **never exposes the upload directory** — `/var/lib/agentlibrary/uploads` has
@@ -628,8 +629,8 @@ sudo firewall-cmd --list-all
 Confirm nothing else is exposed:
 
 ```bash
-sudo firewall-cmd --list-ports          # expect empty
-sudo ss -tlnp | grep -E '3306|8000'     # MySQL/gunicorn must be loopback or absent
+sudo firewall-cmd --list-ports          # expect empty — 8090 must NOT be here
+sudo ss -tlnp | grep -E '3306|8090'     # MySQL/gunicorn must be 127.0.0.1, never 0.0.0.0
 ```
 
 If MySQL is on a separate host, allow only this application server:
@@ -666,19 +667,19 @@ tree needs no `fcontext` rule of its own. That holds only for files created
 label over and nginx then gets `Permission denied` (403 + an AVC). Run
 `restorecon` on the app directory either way.
 
-Three locations do need labels other than the ones they inherit:
+Two locations do need labels other than the ones they inherit:
 
 ```bash
-# 1. The gunicorn socket directory. httpd_var_run_t is what nginx may connect
-#    to. /run is a tmpfs recreated at every boot, so the semanage rule — not
-#    restorecon alone — is what makes this survive a reboot.
-sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
-
-# 2. The private upload store, written by the app and read by nobody else.
+# 1. The private upload store, written by the app and read by nobody else.
 sudo semanage fcontext -a -t var_lib_t "/var/lib/agentlibrary(/.*)?"
 
-# 3. Application logs.
+# 2. Application logs.
 sudo semanage fcontext -a -t httpd_log_t "/var/log/agentlibrary(/.*)?"
+
+# Only if you switch GUNICORN_BIND to a Unix socket: httpd_var_run_t is what
+# nginx may connect to, and /run is a tmpfs recreated at every boot, so the
+# semanage rule — not restorecon alone — is what makes the label survive.
+# sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
 
 # Apply the rules — and the inherited /var/www label — to the files that
 # already exist.
@@ -698,11 +699,23 @@ app outside `/var/www`, add the rule back:
 sudo semanage fcontext -a -t httpd_sys_content_t "<app-dir>/static(/.*)?"
 ```
 
+### The gunicorn port
+
+`httpd_can_network_connect` (below) lets nginx connect to any TCP port,
+including 8090, so nothing else is needed. If you would rather not grant that
+broad boolean, label the port instead and leave the boolean off:
+
+```bash
+sudo semanage port -a -t http_port_t -p tcp 8090
+sudo semanage port -l | grep -w 8090
+```
+
 ### Set the booleans
 
 ```bash
-# Lets nginx (httpd_t) open a connection to the gunicorn socket. Without this,
-# every request returns 502 with "Permission denied" in the nginx error log.
+# Lets nginx (httpd_t) open a connection to gunicorn on 127.0.0.1:8090.
+# Without this (or the port label above), every request returns 502 with
+# "Permission denied" in the nginx error log.
 sudo setsebool -P httpd_can_network_connect 1
 
 # Only if the app must reach MySQL on ANOTHER host:
@@ -714,7 +727,7 @@ sudo getsebool -a | grep httpd_can_network
 ### Verify the labels
 
 ```bash
-ls -Zd /var/www/agentlibrary/static /var/lib/agentlibrary/uploads /run/agentlibrary
+ls -Zd /var/www/agentlibrary/static /var/lib/agentlibrary/uploads
                                   # static: expect httpd_sys_content_t
 sudo semanage fcontext -l | grep agentlibrary
 ps -eZ | grep gunicorn
@@ -744,45 +757,48 @@ sudo semodule -i agentlibrary_local.pp
 
 Before wiring systemd, prove gunicorn serves the app.
 
-**Foreground on the loopback interface:**
+**Foreground, exactly as systemd will run it:**
 
 ```bash
 cd /var/www/agentlibrary
-sudo -u agentlibrary GUNICORN_BIND=127.0.0.1:8000 \
-     .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
+sudo -u agentlibrary .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
 ```
 
 In a second shell:
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8090/health
 # {"checks":{"database":"ok"},"status":"ok","version":"1.0.0"}
-curl -s http://127.0.0.1:8000/api/config | head -c 200
-curl -sI http://127.0.0.1:8000/ | head -5
+curl -s http://127.0.0.1:8090/api/config | head -c 200
+curl -sI http://127.0.0.1:8090/ | head -5
+
+# Loopback only — this must NOT answer from another machine.
+ss -ltnp | grep 8090          # expect 127.0.0.1:8090, never 0.0.0.0:8090
 ```
 
-Then Ctrl-C and test the **Unix socket** exactly as systemd will run it:
+`gunicorn.conf.py` **refuses to start** if `GUNICORN_BIND` names a public
+interface — a public bind would skip TLS, the security headers and the request
+size limit. Do not open 8090 in firewalld either; nginx on the same host is
+the only client.
+
+**If you prefer a Unix socket**, set
+`GUNICORN_BIND=unix:/run/agentlibrary/agentlibrary.sock` in
+`/etc/agentlibrary/agentlibrary.env`, change the nginx `upstream` to match, and
+test it like this:
 
 ```bash
 sudo mkdir -p /run/agentlibrary
 sudo chown agentlibrary:agentlibrary /run/agentlibrary
 sudo chmod 750 /run/agentlibrary
-
-sudo -u agentlibrary .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
+sudo -u agentlibrary GUNICORN_BIND=unix:/run/agentlibrary/agentlibrary.sock \
+     .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
 ```
 
 ```bash
-# Talk to the socket directly
 curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
 ls -lZ /run/agentlibrary/agentlibrary.sock       # srw-rw---- agentlibrary agentlibrary
-
-# Confirm nginx's user can reach it
 sudo -u nginx curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
 ```
-
-`gunicorn.conf.py` **refuses to start** if `GUNICORN_BIND` names a public
-interface — a public bind would skip TLS, the security headers and the request
-size limit.
 
 Check the configuration without serving:
 
@@ -796,8 +812,8 @@ sudo -u agentlibrary .venv/bin/gunicorn --config gunicorn.conf.py --check-config
 ## 13. Health checks
 
 ```bash
-# Through the socket (bypasses nginx — isolates app vs proxy problems)
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+# Straight to gunicorn (bypasses nginx — isolates app vs proxy problems)
+curl -s http://127.0.0.1:8090/health
 
 # Through nginx over HTTP
 curl -s http://agentlibrary.wingsglobaltravel.com/health
@@ -896,7 +912,7 @@ sudo chown -R agentlibrary:agentlibrary /var/lib/agentlibrary/uploads
 sudo restorecon -R /var/lib/agentlibrary
 sudo -u agentlibrary env FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask db upgrade
 sudo systemctl start agentlibrary
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+curl -s http://127.0.0.1:8090/health
 ```
 
 **Test the restore on a staging host quarterly.** An untested backup is a
@@ -996,7 +1012,7 @@ sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask seed-config
 ```bash
 sudo systemctl restart agentlibrary
 sudo systemctl status agentlibrary --no-pager
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+curl -s http://127.0.0.1:8090/health
 sudo journalctl -u agentlibrary -n 50 --no-pager
 ```
 
@@ -1036,7 +1052,7 @@ sudo -u agentlibrary git log --oneline -10
 sudo -u agentlibrary git checkout <previous-good-tag>
 sudo -u agentlibrary .venv/bin/pip install -r requirements.txt   # deps may have changed
 sudo systemctl restart agentlibrary
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+curl -s http://127.0.0.1:8090/health
 ```
 
 ### Database schema
@@ -1064,7 +1080,7 @@ sudo /var/www/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/<pre-dep
 cd /var/www/agentlibrary && sudo -u agentlibrary git checkout <previous-good-tag>
 sudo -u agentlibrary .venv/bin/pip install -r requirements.txt
 sudo systemctl start agentlibrary
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+curl -s http://127.0.0.1:8090/health
 ```
 
 ### Nginx
@@ -1248,14 +1264,19 @@ The concurrency test is a real one: reverting `app/wgt.py` to the prototype's
 systemctl status agentlibrary
 journalctl -u agentlibrary -n 100 --no-pager
 sudo tail -50 /var/log/nginx/agentlibrary.error.log
-ls -lZ /run/agentlibrary/agentlibrary.sock
-sudo -u nginx curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+ss -ltnp | grep 8090                       # is gunicorn listening at all?
+sudo -u nginx curl -s http://127.0.0.1:8090/health
 sudo ausearch -m AVC -ts recent | audit2why
 ```
 
-Usual causes: the service is not running; nginx is not in the `agentlibrary`
-group (`groups nginx`); the socket has the wrong SELinux label; or
-`httpd_can_network_connect` is off.
+Usual causes: the service is not running; the nginx `upstream` port does not
+match `GUNICORN_BIND`; or `httpd_can_network_connect` is off, which is what
+lets nginx (`httpd_t`) open a connection to port 8090 at all — the error log
+says `Permission denied` rather than `Connection refused` in that case.
+
+On a Unix socket instead of TCP, check `ls -lZ
+/run/agentlibrary/agentlibrary.sock`, that nginx is in the `agentlibrary`
+group (`groups nginx`), and the socket's SELinux label.
 
 ### The service will not start
 
@@ -1303,17 +1324,33 @@ sudo -u agentlibrary .venv/bin/gunicorn -c gunicorn.conf.py --print-config wsgi:
 journalctl -u agentlibrary | grep "Agent Library starting"
 ```
 
+### `Address already in use` on port 8090
+
+Something already holds the port — usually a gunicorn left running from a
+foreground test.
+
+```bash
+sudo ss -ltnp | grep 8090
+sudo systemctl stop agentlibrary
+pkill -f 'gunicorn.*agentlibrary' || true
+```
+
+If the port genuinely belongs to another service, pick a different one and
+change both sides — `GUNICORN_BIND` in the environment file and the `upstream`
+in `/etc/nginx/conf.d/agentlibrary.conf`.
+
 ### `connection to /run/agentlibrary/agentlibrary.sock failed`
 
-Running gunicorn by hand without the directory systemd normally creates.
-Either use the service (`sudo systemctl start agentlibrary`), create the
-directory, or bind a loopback port for the test:
+Only applies if you set `GUNICORN_BIND` to a Unix socket: gunicorn was run by
+hand without the directory systemd normally creates. Either use the service
+(`sudo systemctl start agentlibrary`), create the directory, or fall back to
+the default loopback bind:
 
 ```bash
 sudo mkdir -p /run/agentlibrary
 sudo chown agentlibrary:agentlibrary /run/agentlibrary
 # or
-GUNICORN_BIND=127.0.0.1:8000 .venv/bin/gunicorn -c gunicorn.conf.py wsgi:application
+GUNICORN_BIND=127.0.0.1:8090 .venv/bin/gunicorn -c gunicorn.conf.py wsgi:application
 ```
 
 ### Database connection errors
@@ -1377,7 +1414,7 @@ systemctl is-active agentlibrary nginx mysqld
 sudo ss -tlnp
 sudo -u agentlibrary env FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask show-status
 journalctl -u agentlibrary --grep "audit action" -n 50
-curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+curl -s http://127.0.0.1:8090/health
 df -h && free -h && uptime
 ```
 
@@ -1431,7 +1468,9 @@ Work through this before going live. Every item is verifiable with a command.
 
 ### Gunicorn / systemd
 
-- [ ] Bound to a Unix socket (or `127.0.0.1`) — never `0.0.0.0`
+- [ ] Bound to `127.0.0.1:8090` (or a Unix socket) — never `0.0.0.0`
+      (`ss -ltnp | grep 8090`)
+- [ ] The bind port is **not** open in firewalld (`firewall-cmd --list-ports`)
 - [ ] Running as `agentlibrary`, not root (`ps -o user= -C gunicorn`)
 - [ ] `GUNICORN_WORKERS` set for the box; `TimeoutStopSec` > `graceful_timeout`
 - [ ] `systemctl is-enabled agentlibrary` → `enabled`

@@ -7,8 +7,8 @@
 #
 #   sudo systemctl enable --now agentlibrary.socket
 #
-# The default deployment does NOT need this — gunicorn creates the socket in
-# the RuntimeDirectory itself.
+# The default deployment does NOT need this — gunicorn binds 127.0.0.1:8090
+# and nginx proxies to that.
 
 [Unit]
 Description=Agent Library gunicorn socket

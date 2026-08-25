@@ -9,10 +9,12 @@ file context or a boolean.
 
 Three things, in practice:
 
-1. **nginx connecting to the gunicorn Unix socket.** nginx runs as `httpd_t`.
-   It may only connect to sockets it is allowed to reach. Fixed with the
-   `httpd_can_network_connect` boolean plus a correct label on
-   `/run/agentlibrary`.
+1. **nginx connecting to gunicorn.** nginx runs as `httpd_t` and may only
+   connect where policy allows. Gunicorn listens on `127.0.0.1:8090`, so the
+   `httpd_can_network_connect` boolean covers it. The narrower alternative is
+   to label the port — `semanage port -a -t http_port_t -p tcp 8090` — and
+   leave the boolean off. On a Unix socket instead, the boolean plus a correct
+   label on `/run/agentlibrary` is what's needed.
 2. **nginx reading the static directory.** `/var/www(/.*)?` already maps to
    `httpd_sys_content_t` in the shipped policy, so files created *in place*
    under `/var/www/agentlibrary/static` get the right label for free. They do
@@ -31,11 +33,14 @@ See the README, section 11, for the exact sequence. The short version:
 ```bash
 # No fcontext rule for the static tree: /var/www(/.*)? is already
 # httpd_sys_content_t in the base policy. Just enforce it.
-sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
-sudo semanage fcontext -a -t var_lib_t       "/var/lib/agentlibrary(/.*)?"
-sudo semanage fcontext -a -t httpd_log_t     "/var/log/agentlibrary(/.*)?"
+sudo semanage fcontext -a -t var_lib_t   "/var/lib/agentlibrary(/.*)?"
+sudo semanage fcontext -a -t httpd_log_t "/var/log/agentlibrary(/.*)?"
 sudo restorecon -Rv /var/www/agentlibrary /var/lib/agentlibrary /var/log/agentlibrary
 sudo setsebool -P httpd_can_network_connect 1
+
+# Only when GUNICORN_BIND names a Unix socket:
+# sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
+# sudo restorecon -Rv /run/agentlibrary
 ```
 
 Deploying under `/var/www` labels the *whole* application directory
@@ -49,9 +54,9 @@ add the rule back:
 sudo semanage fcontext -a -t httpd_sys_content_t "<app-dir>/static(/.*)?"
 ```
 
-`/run` is a tmpfs recreated at boot, so the `semanage fcontext` rule for
-`/run/agentlibrary` is what makes the label survive a reboot — `restorecon`
-alone would not.
+`/run` is a tmpfs recreated at boot, so on a Unix socket the `semanage
+fcontext` rule for `/run/agentlibrary` is what makes the label survive a
+reboot — `restorecon` alone would not.
 
 ## Reading denials
 
