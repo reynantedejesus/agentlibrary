@@ -13,24 +13,40 @@ Three things, in practice:
    It may only connect to sockets it is allowed to reach. Fixed with the
    `httpd_can_network_connect` boolean plus a correct label on
    `/run/agentlibrary`.
-2. **nginx reading the static directory.** `/opt/agentlibrary/static` is not a
-   default web root, so its files carry `usr_t` rather than `httpd_sys_content_t`
-   and nginx gets `Permission denied` (a 403 with an AVC in the audit log).
+2. **nginx reading the static directory.** `/var/www(/.*)?` already maps to
+   `httpd_sys_content_t` in the shipped policy, so files created *in place*
+   under `/var/www/agentlibrary/static` get the right label for free. They do
+   **not** if you copied or moved them in from somewhere else (`cp -a`, `mv`,
+   `tar` from `/root` or `/tmp` preserves the source label), which leaves
+   `admin_home_t` or `user_tmp_t` and gets nginx `Permission denied` — a 403
+   with an AVC in the audit log. `restorecon` fixes it; run it either way.
 3. **The app writing uploads.** `/var/lib/agentlibrary/uploads` must be
    writable by the service. As an unconfined systemd service this normally
    works, but the label still matters if you later confine it.
 
 ## Commands
 
-See the README, section 7, for the exact sequence. The short version:
+See the README, section 11, for the exact sequence. The short version:
 
 ```bash
-sudo semanage fcontext -a -t httpd_sys_content_t "/opt/agentlibrary/static(/.*)?"
-sudo semanage fcontext -a -t httpd_var_run_t     "/run/agentlibrary(/.*)?"
-sudo semanage fcontext -a -t var_lib_t           "/var/lib/agentlibrary(/.*)?"
-sudo semanage fcontext -a -t httpd_log_t         "/var/log/agentlibrary(/.*)?"
-sudo restorecon -Rv /opt/agentlibrary/static /var/lib/agentlibrary /var/log/agentlibrary
+# No fcontext rule for the static tree: /var/www(/.*)? is already
+# httpd_sys_content_t in the base policy. Just enforce it.
+sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
+sudo semanage fcontext -a -t var_lib_t       "/var/lib/agentlibrary(/.*)?"
+sudo semanage fcontext -a -t httpd_log_t     "/var/log/agentlibrary(/.*)?"
+sudo restorecon -Rv /var/www/agentlibrary /var/lib/agentlibrary /var/log/agentlibrary
 sudo setsebool -P httpd_can_network_connect 1
+```
+
+Deploying under `/var/www` labels the *whole* application directory
+`httpd_sys_content_t`, including the code and the virtualenv. That is harmless:
+gunicorn runs as an unconfined systemd service and may execute it, and nginx
+only ever serves the paths its `location` blocks name — it has no `alias` for
+anything but `/static/`. If you relocate the app outside `/var/www`, you must
+add the rule back:
+
+```bash
+sudo semanage fcontext -a -t httpd_sys_content_t "<app-dir>/static(/.*)?"
 ```
 
 `/run` is a tmpfs recreated at boot, so the `semanage fcontext` rule for

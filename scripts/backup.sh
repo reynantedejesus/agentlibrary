@@ -2,12 +2,12 @@
 #
 # Agent Library backup — database + uploaded files.
 #
-#   sudo /opt/agentlibrary/scripts/backup.sh
-#   sudo /opt/agentlibrary/scripts/backup.sh /mnt/backups
+#   sudo /var/www/agentlibrary/scripts/backup.sh
+#   sudo /var/www/agentlibrary/scripts/backup.sh /mnt/backups
 #
 # Cron (03:15 daily):
 #   sudo crontab -e
-#   15 3 * * * /opt/agentlibrary/scripts/backup.sh >> /var/log/agentlibrary/backup.log 2>&1
+#   15 3 * * * /var/www/agentlibrary/scripts/backup.sh >> /var/log/agentlibrary/backup.log 2>&1
 #
 # The database dump is consistent on its own (--single-transaction on InnoDB
 # takes a snapshot without locking writers). Files are copied afterwards, so a
@@ -79,8 +79,8 @@ timestamp=${STAMP}
 host=$(hostname -f)
 database=${MYSQL_DATABASE}
 upload_dir=${UPLOAD_DIR}
-alembic_head=$(cd /opt/agentlibrary 2>/dev/null && \
-    FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask db current 2>/dev/null | tail -1 || echo unknown)
+alembic_head=$(cd /var/www/agentlibrary 2>/dev/null && \
+    FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask db current 2>/dev/null | tail -1 || echo unknown)
 MANIFESTEOF
 
 sha256sum "${DEST}"/* > "${DEST}/SHA256SUMS" 2>/dev/null || true

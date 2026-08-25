@@ -26,12 +26,13 @@ systemd · SELinux enforcing · firewalld · HTTPS
 12. [Gunicorn test command](#12-gunicorn-test-command)
 13. [Health checks](#13-health-checks)
 14. [Backup and restore](#14-backup-and-restore)
-15. [Rollback](#15-rollback)
-16. [Malware scanning](#16-malware-scanning)
-17. [API reference](#17-api-reference)
-18. [Testing](#18-testing)
-19. [Troubleshooting](#19-troubleshooting)
-20. [Production-readiness checklist](#20-production-readiness-checklist)
+15. [Deploying an update](#15-deploying-an-update)
+16. [Rollback](#16-rollback)
+17. [Malware scanning](#17-malware-scanning)
+18. [API reference](#18-api-reference)
+19. [Testing](#19-testing)
+20. [Troubleshooting](#20-troubleshooting)
+21. [Production-readiness checklist](#21-production-readiness-checklist)
 
 Design analysis, the localStorage/mock-data inventory, the UI-action → route
 map, the schema and the migration plan are in **[`docs/ANALYSIS.md`](docs/ANALYSIS.md)**.
@@ -205,7 +206,7 @@ sudo dnf -y install nginx openssl curl git tar gzip logrotate \
 # Optional: TLS via Let's Encrypt
 sudo dnf -y install certbot python3-certbot-nginx
 
-# Optional: malware scanning (see section 16)
+# Optional: malware scanning (see section 17)
 # sudo dnf -y install clamav clamav-update clamd
 
 sudo systemctl enable --now firewalld
@@ -228,49 +229,49 @@ id agentlibrary
 ### 4.3 Directories
 
 ```bash
-sudo mkdir -p /opt/agentlibrary                 # application code
+sudo mkdir -p /var/www/agentlibrary                 # application code
 sudo mkdir -p /var/lib/agentlibrary/uploads     # private file store
 sudo mkdir -p /var/log/agentlibrary             # application log
 sudo mkdir -p /etc/agentlibrary                 # environment file
 sudo mkdir -p /var/backups/agentlibrary         # backups
 
-sudo chown -R agentlibrary:agentlibrary /opt/agentlibrary \
+sudo chown -R agentlibrary:agentlibrary /var/www/agentlibrary \
                                         /var/lib/agentlibrary \
                                         /var/log/agentlibrary
-sudo chmod 750 /opt/agentlibrary /var/log/agentlibrary
+sudo chmod 750 /var/www/agentlibrary /var/log/agentlibrary
 sudo chmod 750 /var/lib/agentlibrary /var/lib/agentlibrary/uploads
 sudo chmod 700 /var/backups/agentlibrary
 sudo chmod 750 /etc/agentlibrary
 
 # nginx reads only the static tree.
-sudo chmod 755 /opt/agentlibrary/static 2>/dev/null || true
+sudo chmod 755 /var/www/agentlibrary/static 2>/dev/null || true
 ```
 
 ### 4.4 Deploy the code
 
 ```bash
-sudo -u agentlibrary git clone <repo-url> /opt/agentlibrary
-# or: sudo tar -xzf agentlibrary.tar.gz -C /opt/agentlibrary --strip-components=1
-cd /opt/agentlibrary
-sudo chown -R agentlibrary:agentlibrary /opt/agentlibrary
+sudo -u agentlibrary git clone <repo-url> /var/www/agentlibrary
+# or: sudo tar -xzf agentlibrary.tar.gz -C /var/www/agentlibrary --strip-components=1
+cd /var/www/agentlibrary
+sudo chown -R agentlibrary:agentlibrary /var/www/agentlibrary
 ```
 
 ### 4.5 Virtual environment and dependencies
 
 ```bash
-sudo -u agentlibrary python3 -m venv /opt/agentlibrary/.venv
-sudo -u agentlibrary /opt/agentlibrary/.venv/bin/pip install --upgrade pip wheel
-sudo -u agentlibrary /opt/agentlibrary/.venv/bin/pip install -r /opt/agentlibrary/requirements.txt
+sudo -u agentlibrary python3 -m venv /var/www/agentlibrary/.venv
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/pip install --upgrade pip wheel
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/pip install -r /var/www/agentlibrary/requirements.txt
 
 # Verify
-sudo -u agentlibrary /opt/agentlibrary/.venv/bin/python -c \
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/python -c \
   "import flask, sqlalchemy, pymysql, gunicorn; print('dependencies OK')"
 ```
 
 ### 4.6 Environment file
 
 ```bash
-sudo cp /opt/agentlibrary/.env.example /etc/agentlibrary/agentlibrary.env
+sudo cp /var/www/agentlibrary/.env.example /etc/agentlibrary/agentlibrary.env
 sudo chown root:agentlibrary /etc/agentlibrary/agentlibrary.env
 sudo chmod 640 /etc/agentlibrary/agentlibrary.env    # NOT world-readable
 
@@ -403,7 +404,7 @@ sudo systemctl restart mysqld
 ## 6. Migrations
 
 ```bash
-cd /opt/agentlibrary
+cd /var/www/agentlibrary
 export FLASK_APP=wsgi.py
 
 # What is applied now, and what exists
@@ -453,7 +454,7 @@ No password is ever hard-coded, defaulted, or written into source.
 **Interactive (preferred):**
 
 ```bash
-cd /opt/agentlibrary
+cd /var/www/agentlibrary
 sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask \
     create-admin --email admin@wingsglobaltravel.com --name "Governance Admin"
 # New password (min 12 chars): ********
@@ -487,8 +488,8 @@ console asks for the password only.
 ## 8. systemd
 
 ```bash
-sudo install -m 0644 /opt/agentlibrary/deploy/agentlibrary.service /etc/systemd/system/
-sudo install -m 0644 /opt/agentlibrary/deploy/agentlibrary-logrotate /etc/logrotate.d/agentlibrary
+sudo install -m 0644 /var/www/agentlibrary/deploy/agentlibrary.service /etc/systemd/system/
+sudo install -m 0644 /var/www/agentlibrary/deploy/agentlibrary-logrotate /etc/logrotate.d/agentlibrary
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now agentlibrary
@@ -536,8 +537,8 @@ systemd-analyze verify /etc/systemd/system/agentlibrary.service
 ## 9. Nginx
 
 ```bash
-sudo install -m 0644 /opt/agentlibrary/deploy/agentlibrary-proxy.inc /etc/nginx/conf.d/
-sudo install -m 0644 /opt/agentlibrary/deploy/nginx-agentlibrary.conf /etc/nginx/conf.d/agentlibrary.conf
+sudo install -m 0644 /var/www/agentlibrary/deploy/agentlibrary-proxy.inc /etc/nginx/conf.d/
+sudo install -m 0644 /var/www/agentlibrary/deploy/nginx-agentlibrary.conf /etc/nginx/conf.d/agentlibrary.conf
 
 sudo vi /etc/nginx/conf.d/agentlibrary.conf   # set server_name and cert paths
 
@@ -656,31 +657,45 @@ sudo semodule -l | head
 
 ### Set the contexts
 
-SELinux decides by *label*, not by path. Four locations need labels other than
-the defaults they inherit:
+SELinux decides by *label*, not by path.
+
+The application lives under `/var/www`, which the base policy already maps to
+`httpd_sys_content_t` — the label nginx is permitted to read — so the static
+tree needs no `fcontext` rule of its own. That holds only for files created
+*in place*: a `cp -a`, `mv`, or `tar` from `/root` or `/tmp` carries the source
+label over and nginx then gets `Permission denied` (403 + an AVC). Run
+`restorecon` on the app directory either way.
+
+Three locations do need labels other than the ones they inherit:
 
 ```bash
-# 1. Static assets. /opt is not a web root, so files there get usr_t and nginx
-#    is denied read access (403 + an AVC). httpd_sys_content_t is the label
-#    nginx is permitted to read.
-sudo semanage fcontext -a -t httpd_sys_content_t "/opt/agentlibrary/static(/.*)?"
-
-# 2. The gunicorn socket directory. httpd_var_run_t is what nginx may connect
+# 1. The gunicorn socket directory. httpd_var_run_t is what nginx may connect
 #    to. /run is a tmpfs recreated at every boot, so the semanage rule — not
 #    restorecon alone — is what makes this survive a reboot.
 sudo semanage fcontext -a -t httpd_var_run_t "/run/agentlibrary(/.*)?"
 
-# 3. The private upload store, written by the app and read by nobody else.
+# 2. The private upload store, written by the app and read by nobody else.
 sudo semanage fcontext -a -t var_lib_t "/var/lib/agentlibrary(/.*)?"
 
-# 4. Application logs.
+# 3. Application logs.
 sudo semanage fcontext -a -t httpd_log_t "/var/log/agentlibrary(/.*)?"
 
-# Apply the rules to the files that already exist.
-sudo restorecon -Rv /opt/agentlibrary/static \
+# Apply the rules — and the inherited /var/www label — to the files that
+# already exist.
+sudo restorecon -Rv /var/www/agentlibrary \
                     /var/lib/agentlibrary \
                     /var/log/agentlibrary
 sudo restorecon -Rv /run/agentlibrary 2>/dev/null || true
+```
+
+Labelling the whole application directory `httpd_sys_content_t` also covers the
+code and the virtualenv. That is harmless: gunicorn runs as an unconfined
+systemd service and may execute it, and nginx serves only the paths its
+`location` blocks name — the sole `alias` is `/static/`. If you ever move the
+app outside `/var/www`, add the rule back:
+
+```bash
+sudo semanage fcontext -a -t httpd_sys_content_t "<app-dir>/static(/.*)?"
 ```
 
 ### Set the booleans
@@ -699,7 +714,8 @@ sudo getsebool -a | grep httpd_can_network
 ### Verify the labels
 
 ```bash
-ls -Zd /opt/agentlibrary/static /var/lib/agentlibrary/uploads /run/agentlibrary
+ls -Zd /var/www/agentlibrary/static /var/lib/agentlibrary/uploads /run/agentlibrary
+                                  # static: expect httpd_sys_content_t
 sudo semanage fcontext -l | grep agentlibrary
 ps -eZ | grep gunicorn
 ```
@@ -731,7 +747,7 @@ Before wiring systemd, prove gunicorn serves the app.
 **Foreground on the loopback interface:**
 
 ```bash
-cd /opt/agentlibrary
+cd /var/www/agentlibrary
 sudo -u agentlibrary GUNICORN_BIND=127.0.0.1:8000 \
      .venv/bin/gunicorn --config gunicorn.conf.py wsgi:application
 ```
@@ -812,7 +828,7 @@ Fuller post-deploy verification:
 systemctl is-active agentlibrary nginx mysqld
 curl -sI https://agentlibrary.wingsglobaltravel.com/ | grep -Ei 'HTTP/|strict-transport|x-frame|content-security'
 curl -s https://agentlibrary.wingsglobaltravel.com/api/config | head -c 120
-sudo -u agentlibrary env FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask show-status
+sudo -u agentlibrary env FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask show-status
 ```
 
 ---
@@ -822,9 +838,9 @@ sudo -u agentlibrary env FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask sho
 ### Automated backup
 
 ```bash
-sudo install -m 0750 -o root -g root /opt/agentlibrary/scripts/backup.sh /opt/agentlibrary/scripts/backup.sh
-sudo /opt/agentlibrary/scripts/backup.sh                       # default /var/backups/agentlibrary
-sudo /opt/agentlibrary/scripts/backup.sh /mnt/nfs/backups      # elsewhere
+sudo install -m 0750 -o root -g root /var/www/agentlibrary/scripts/backup.sh /var/www/agentlibrary/scripts/backup.sh
+sudo /var/www/agentlibrary/scripts/backup.sh                       # default /var/backups/agentlibrary
+sudo /var/www/agentlibrary/scripts/backup.sh /mnt/nfs/backups      # elsewhere
 ```
 
 Schedule it (03:15 daily, 30-day retention):
@@ -834,9 +850,9 @@ sudo crontab -e
 ```
 
 ```cron
-15 3 * * * /opt/agentlibrary/scripts/backup.sh >> /var/log/agentlibrary/backup.log 2>&1
+15 3 * * * /var/www/agentlibrary/scripts/backup.sh >> /var/log/agentlibrary/backup.log 2>&1
 # Sweep files uploaded to forms that were never submitted.
-45 3 * * * cd /opt/agentlibrary && FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask prune-uploads --hours 24 --yes >> /var/log/agentlibrary/prune.log 2>&1
+45 3 * * * cd /var/www/agentlibrary && FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask prune-uploads --hours 24 --yes >> /var/log/agentlibrary/prune.log 2>&1
 ```
 
 Each run produces a timestamped directory containing `database.sql.gz`,
@@ -861,7 +877,7 @@ sudo tar -czf uploads-$(date +%F).tar.gz -C /var/lib/agentlibrary uploads
 ### Restore
 
 ```bash
-sudo /opt/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/20260820-031500
+sudo /var/www/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/20260820-031500
 ```
 
 The script verifies checksums, stops the service, takes a safety dump of the
@@ -878,7 +894,7 @@ gunzip -c agentlibrary-2026-08-20.sql.gz \
 sudo tar -xzf uploads-2026-08-20.tar.gz -C /var/lib/agentlibrary
 sudo chown -R agentlibrary:agentlibrary /var/lib/agentlibrary/uploads
 sudo restorecon -R /var/lib/agentlibrary
-sudo -u agentlibrary env FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask db upgrade
+sudo -u agentlibrary env FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask db upgrade
 sudo systemctl start agentlibrary
 curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
 ```
@@ -888,12 +904,134 @@ hypothesis, not a backup.
 
 ---
 
-## 15. Rollback
+## 15. Deploying an update
+
+Pulling a new version of the application onto a host that is already running.
+Use this for any upgrade — including the v41 workflow release, which adds the
+`update_requests` table and the staged-upload flow.
+
+### 15.1 Back up first
+
+A migration is not reversible in the general case. Take the backup before you
+touch anything:
+
+```bash
+sudo /var/www/agentlibrary/scripts/backup.sh
+```
+
+### 15.2 Fetch the new code
+
+```bash
+cd /var/www/agentlibrary
+sudo -u agentlibrary git remote -v                      # confirm the remote
+sudo -u agentlibrary git fetch origin                   # get the refs
+sudo -u agentlibrary git status                         # confirm a clean tree
+sudo -u agentlibrary git branch --show-current          # which branch are you on?
+```
+
+`git pull` with nothing to show almost always means one of three things:
+
+| Symptom | Check | Fix |
+| --- | --- | --- |
+| `fatal: not a git repository` | `git -C /var/www/agentlibrary rev-parse --git-dir` | The tree was unpacked from a tarball. Clone instead, or copy the files in. |
+| `Already up to date.` but the files are old | `git branch --show-current` | You are on a different branch. `git checkout <branch>` first. |
+| `HEAD detached at <sha>` | `git status` first line | `git checkout <branch>` to reattach, then pull. |
+
+Then move onto the release you want:
+
+```bash
+sudo -u agentlibrary git checkout <branch-or-tag>
+sudo -u agentlibrary git pull origin <branch-or-tag>
+sudo -u agentlibrary git log --oneline -3               # confirm the new commit
+```
+
+If the working tree has local edits, `git pull` refuses rather than
+overwriting them. Either commit them, or `git stash` them, or — if they are
+throwaway — `git checkout -- <path>`. Do not `git reset --hard` on a host you
+have not backed up.
+
+### 15.3 Dependencies
+
+```bash
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/pip install \
+    -r /var/www/agentlibrary/requirements.txt
+```
+
+Dependencies are removed as well as added between releases. `pip` does not
+uninstall what is no longer listed; that is harmless, but if you want the
+venv to match the file exactly, rebuild it:
+
+```bash
+sudo -u agentlibrary rm -rf /var/www/agentlibrary/.venv
+sudo -u agentlibrary python3 -m venv /var/www/agentlibrary/.venv
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/pip install --upgrade pip wheel
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/pip install \
+    -r /var/www/agentlibrary/requirements.txt
+```
+
+### 15.4 Schema
+
+```bash
+cd /var/www/agentlibrary
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db current
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db upgrade
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db current
+```
+
+The v41 release ends at `0002_update_requests`. `db upgrade` is a no-op if the
+schema is already there, so it is safe to re-run.
+
+### 15.5 Reference data
+
+Reference data (departments, asset types, statuses, tag vocabulary) is seeded,
+not migrated, so a release that changes it needs the seed re-run. It is
+idempotent and never touches assets:
+
+```bash
+sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask seed-config
+```
+
+### 15.6 Restart and verify
+
+```bash
+sudo systemctl restart agentlibrary
+sudo systemctl status agentlibrary --no-pager
+curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
+sudo journalctl -u agentlibrary -n 50 --no-pager
+```
+
+Static assets change between releases and browsers cache them. The templates
+carry a version query string, so a normal reload is enough; if you edited
+files in place, force-reload with Ctrl+Shift+R once to confirm.
+
+### 15.7 Housekeeping the new upload staging area
+
+From v41 the submission form uploads files *before* the form is submitted, so
+an abandoned form leaves rows with no owning asset. Sweep them on a schedule:
+
+```bash
+sudo crontab -e
+```
+
+```cron
+45 3 * * * cd /var/www/agentlibrary && FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask prune-uploads --hours 24 --yes >> /var/log/agentlibrary/prune.log 2>&1
+```
+
+Run it once by hand first, without `--yes`, to see what it would remove.
+
+### 15.8 If the upgrade goes wrong
+
+Section 16 covers rollback. The short version: restore the pre-deploy backup
+from 15.1, check out the previous tag, reinstall dependencies, restart.
+
+---
+
+## 16. Rollback
 
 ### Application code
 
 ```bash
-cd /opt/agentlibrary
+cd /var/www/agentlibrary
 sudo -u agentlibrary git log --oneline -10
 sudo -u agentlibrary git checkout <previous-good-tag>
 sudo -u agentlibrary .venv/bin/pip install -r requirements.txt   # deps may have changed
@@ -904,7 +1042,7 @@ curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/healt
 ### Database schema
 
 ```bash
-cd /opt/agentlibrary
+cd /var/www/agentlibrary
 export FLASK_APP=wsgi.py
 
 sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db current
@@ -922,8 +1060,8 @@ sudo -u agentlibrary env FLASK_APP=wsgi.py .venv/bin/flask db downgrade 0001_ini
 
 ```bash
 sudo systemctl stop agentlibrary
-sudo /opt/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/<pre-deploy-backup>
-cd /opt/agentlibrary && sudo -u agentlibrary git checkout <previous-good-tag>
+sudo /var/www/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/<pre-deploy-backup>
+cd /var/www/agentlibrary && sudo -u agentlibrary git checkout <previous-good-tag>
 sudo -u agentlibrary .venv/bin/pip install -r requirements.txt
 sudo systemctl start agentlibrary
 curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
@@ -940,12 +1078,12 @@ sudo nginx -t && sudo systemctl reload nginx
 improvisation:
 
 ```bash
-sudo /opt/agentlibrary/scripts/backup.sh
+sudo /var/www/agentlibrary/scripts/backup.sh
 ```
 
 ---
 
-## 16. Malware scanning
+## 17. Malware scanning
 
 Uploads are validated by extension, sniffed MIME type, magic bytes and size
 (`app/storage.py`), and executable content is refused outright. Content scanning
@@ -1017,7 +1155,7 @@ clamdscan /tmp/eicar.txt        # expect: Eicar-Signature FOUND
 
 ---
 
-## 17. API reference
+## 18. API reference
 
 All responses use one of two envelopes:
 
@@ -1077,7 +1215,7 @@ cookie, or `GET /api/auth/csrf`.
 
 ---
 
-## 18. Testing
+## 19. Testing
 
 ```bash
 source .venv/bin/activate
@@ -1102,7 +1240,7 @@ The concurrency test is a real one: reverting `app/wgt.py` to the prototype's
 
 ---
 
-## 19. Troubleshooting
+## 20. Troubleshooting
 
 ### The site returns 502 Bad Gateway
 
@@ -1123,7 +1261,7 @@ group (`groups nginx`); the socket has the wrong SELinux label; or
 
 ```bash
 journalctl -u agentlibrary -n 50 --no-pager
-sudo -u agentlibrary /opt/agentlibrary/.venv/bin/python -c \
+sudo -u agentlibrary /var/www/agentlibrary/.venv/bin/python -c \
      "import app; app.create_app(); print('factory OK')"
 sudo -u agentlibrary test -r /etc/agentlibrary/agentlibrary.env && echo readable
 systemd-analyze verify /etc/systemd/system/agentlibrary.service
@@ -1209,9 +1347,9 @@ invalidated) or the clock is skewed (`timedatectl status`).
 ### Static files 403 / 404
 
 ```bash
-ls -lZ /opt/agentlibrary/static/css/app.css       # expect httpd_sys_content_t
-sudo restorecon -Rv /opt/agentlibrary/static
-namei -l /opt/agentlibrary/static/css/app.css     # every parent needs +x for nginx
+ls -lZ /var/www/agentlibrary/static/css/app.css       # expect httpd_sys_content_t
+sudo restorecon -Rv /var/www/agentlibrary/static
+namei -l /var/www/agentlibrary/static/css/app.css     # every parent needs +x for nginx
 ```
 
 ### Uploads fail with a permission error
@@ -1237,7 +1375,7 @@ RATELIMIT_STORAGE_URI=redis://127.0.0.1:6379/0
 ```bash
 systemctl is-active agentlibrary nginx mysqld
 sudo ss -tlnp
-sudo -u agentlibrary env FLASK_APP=wsgi.py /opt/agentlibrary/.venv/bin/flask show-status
+sudo -u agentlibrary env FLASK_APP=wsgi.py /var/www/agentlibrary/.venv/bin/flask show-status
 journalctl -u agentlibrary --grep "audit action" -n 50
 curl -s --unix-socket /run/agentlibrary/agentlibrary.sock http://localhost/health
 df -h && free -h && uptime
@@ -1245,7 +1383,7 @@ df -h && free -h && uptime
 
 ---
 
-## 20. Production-readiness checklist
+## 21. Production-readiness checklist
 
 Work through this before going live. Every item is verifiable with a command.
 
@@ -1253,10 +1391,10 @@ Work through this before going live. Every item is verifiable with a command.
 
 - [ ] `SECRET_KEY` is a unique 64-character random value, not the example
 - [ ] `/etc/agentlibrary/agentlibrary.env` is `root:agentlibrary`, mode `0640`
-- [ ] No `.env` file exists in `/opt/agentlibrary` (`ls -la /opt/agentlibrary/.env`)
+- [ ] No `.env` file exists in `/var/www/agentlibrary` (`ls -la /var/www/agentlibrary/.env`)
 - [ ] `.gitignore` excludes `.env` and `git status` shows no secret staged
 - [ ] `ADMIN_INITIAL_PASSWORD` is **not** left in the environment file
-- [ ] `grep -r "Wings123" /opt/agentlibrary --exclude-dir=.git` returns nothing
+- [ ] `grep -r "Wings123" /var/www/agentlibrary --exclude-dir=.git` returns nothing
 - [ ] `FLASK_ENV=production` and `flask show-status` runs without warnings
 
 ### Application

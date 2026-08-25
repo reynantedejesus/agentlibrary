@@ -2,7 +2,7 @@
 #
 # Agent Library restore — database + uploaded files.
 #
-#   sudo /opt/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/20260820-031500
+#   sudo /var/www/agentlibrary/scripts/restore.sh /var/backups/agentlibrary/20260820-031500
 #
 # THIS OVERWRITES THE CURRENT DATABASE AND UPLOAD DIRECTORY. It stops the
 # service first, takes a safety dump of what is there now, restores, runs any
@@ -11,7 +11,7 @@ set -euo pipefail
 
 BACKUP_DIR="${1:?Usage: restore.sh /path/to/backup-directory}"
 ENV_FILE="${ENV_FILE:-/etc/agentlibrary/agentlibrary.env}"
-APP_DIR="${APP_DIR:-/opt/agentlibrary}"
+APP_DIR="${APP_DIR:-/var/www/agentlibrary}"
 
 log() { printf '%s  %s\n' "$(date --iso-8601=seconds)" "$*"; }
 fail() { log "ERROR: $*" >&2; exit 1; }

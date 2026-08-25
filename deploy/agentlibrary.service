@@ -16,7 +16,7 @@
 
 [Unit]
 Description=Agent Library (Wings Global Travel) — Gunicorn
-Documentation=file:/opt/agentlibrary/README.md
+Documentation=file:/var/www/agentlibrary/README.md
 After=network-online.target mariadb.service mysqld.service
 Wants=network-online.target
 
@@ -28,12 +28,12 @@ Group=agentlibrary
 # connect to the 0660 socket without opening it to the world.
 UMask=0007
 
-WorkingDirectory=/opt/agentlibrary
+WorkingDirectory=/var/www/agentlibrary
 
 # All configuration and secrets live here — root-owned, group-readable by the
 # service account, mode 0640. Nothing sensitive is in the unit file itself.
 EnvironmentFile=/etc/agentlibrary/agentlibrary.env
-Environment="PATH=/opt/agentlibrary/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/var/www/agentlibrary/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 
@@ -46,9 +46,9 @@ StateDirectoryMode=0750
 LogsDirectory=agentlibrary
 LogsDirectoryMode=0750
 
-ExecStartPre=/opt/agentlibrary/.venv/bin/python -c "import app; app.create_app()"
-ExecStart=/opt/agentlibrary/.venv/bin/gunicorn \
-    --config /opt/agentlibrary/gunicorn.conf.py \
+ExecStartPre=/var/www/agentlibrary/.venv/bin/python -c "import app; app.create_app()"
+ExecStart=/var/www/agentlibrary/.venv/bin/gunicorn \
+    --config /var/www/agentlibrary/gunicorn.conf.py \
     wsgi:application
 ExecReload=/bin/kill -s HUP $MAINPID
 

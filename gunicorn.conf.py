@@ -2,8 +2,8 @@
 
 Used by systemd::
 
-    ExecStart=/opt/agentlibrary/.venv/bin/gunicorn \
-        --config /opt/agentlibrary/gunicorn.conf.py wsgi:application
+    ExecStart=/var/www/agentlibrary/.venv/bin/gunicorn \
+        --config /var/www/agentlibrary/gunicorn.conf.py wsgi:application
 
 Every knob reads an environment variable so the same file works in staging and
 production without edits — the values come from
