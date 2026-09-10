@@ -18,7 +18,7 @@ from typing import Optional
 from flask import Flask, render_template, request
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 # Where a production deployment keeps its environment file. systemd loads this

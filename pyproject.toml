@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentlibrary"
-version = "1.0.0"
+version = "1.1.0"
 description = "Wings Global Travel — internal AI asset registry and catalogue"
 readme = "README.md"
 requires-python = ">=3.9"

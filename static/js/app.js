@@ -832,7 +832,6 @@ function renderAssetCard(asset, query){
       <div class="ac-desc">${Util.highlight(asset.description, query)}</div>
       <div class="ac-meta-row">
         <span>${h(asset.department)}</span>
-        <span class="dot-sep">${h(asset.platform)}</span>
         <span class="dot-sep">Owner: ${asset.owner ? h(asset.owner) : "—"}</span>
       </div>
       <div class="ac-tags">${tags}</div>
@@ -1265,6 +1264,14 @@ function dlItem(k, v){ return `<div class="dl-item"><div class="k">${h(k)}</div>
 
 function renderPaneOverview(asset){
   return `
+  ${asset.rejectionReason ? `<div class="warn-banner">${Icon.warn}<span>
+    <strong>Rejection note:</strong> ${h(asset.rejectionReason)}</span></div>` : ""}
+  <div class="panel-card">
+    <h4>Description</h4>
+    <p class="body-text">${h(asset.description)}</p>
+  </div>
+  ${asset.problemSolved ? `<div class="panel-card"><h4>What problem does this solve?</h4>
+    <p class="body-text">${h(asset.problemSolved)}</p></div>` : ""}
   <div class="dl-grid">
     ${dlItem("WGT ID", `<span class="mono-cell">${h(asset.wgtCode)}</span>`)}
     ${dlItem("Type", h(Util.typeMeta(asset.type).label))}
@@ -1279,15 +1286,7 @@ function renderPaneOverview(asset){
     ${dlItem("Last updated", h(Util.formatDateShort(asset.lastUpdated)))}
     ${dlItem("Next review", h(Util.formatDateShort(asset.nextReviewDate)))}
     ${dlItem("Status", renderStatusBadge(asset))}
-  </div>
-  ${asset.rejectionReason ? `<div class="warn-banner">${Icon.warn}<span>
-    <strong>Rejection note:</strong> ${h(asset.rejectionReason)}</span></div>` : ""}
-  <div class="panel-card">
-    <h4>Description</h4>
-    <p class="body-text">${h(asset.description)}</p>
-  </div>
-  ${asset.problemSolved ? `<div class="panel-card"><h4>What problem does this solve?</h4>
-    <p class="body-text">${h(asset.problemSolved)}</p></div>` : ""}`;
+  </div>`;
 }
 
 /** Copy buttons stash the payload in a module-level map keyed by index rather

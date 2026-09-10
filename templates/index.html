@@ -15,7 +15,10 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Montserrat:wght@400;500;600;700&family=Caveat:wght@500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+{# ?v= busts the browser and nginx caches on every release. Static files are
+   served with Cache-Control: max-age=3600, so without this a deploy that only
+   touches CSS or JS can keep showing the previous build for up to an hour. #}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v=app_version) }}">
 <link rel="icon" href="{{ url_for('static', filename='images/wings-logo.png') }}" type="image/png">
 </head>
 <body>
@@ -101,6 +104,6 @@
 {{ {"unlocked": bootstrap_unlocked, "version": app_version} | tojson }}
 </script>
 
-<script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+<script src="{{ url_for('static', filename='js/app.js', v=app_version) }}" defer></script>
 </body>
 </html>

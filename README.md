@@ -1016,9 +1016,19 @@ curl -s http://127.0.0.1:8090/health
 sudo journalctl -u agentlibrary -n 50 --no-pager
 ```
 
-Static assets change between releases and browsers cache them. The templates
-carry a version query string, so a normal reload is enough; if you edited
-files in place, force-reload with Ctrl+Shift+R once to confirm.
+Static assets change between releases and are served with
+`Cache-Control: max-age=3600`. `templates/index.html` appends `?v=<app version>`
+to the CSS and JS URLs, so a release that bumps `__version__` in `app/__init__.py`
+changes those URLs and every browser refetches them immediately.
+
+**If you ship a CSS or JS change without bumping the version**, the URL is
+unchanged and browsers may serve the old file for up to an hour. Either bump
+`__version__`, or tell users to force-reload once (Ctrl+Shift+R). To confirm
+which build a browser actually has:
+
+```bash
+curl -s https://agentlibrary.wingsglobaltravel.com/ | grep -o 'app\.\(css\|js\)?v=[0-9.]*'
+```
 
 ### 15.7 Housekeeping the new upload staging area
 

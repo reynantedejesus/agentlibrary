@@ -390,18 +390,27 @@ textarea:focus-visible, [tabindex]:focus-visible{
      card, regardless of how long this particular asset's name,
      description, or tag list happens to be — or how tall its neighbors'
      stubs are. Any leftover stretch height is absorbed by .ac-stub instead,
-     below the perforation, where it's invisible. */
+     below the perforation, where it's invisible. 250 originally; +38 to
+     288 to fit the WGT code's own line under the name *and* a 4-line
+     description at once; pulled back down a bit to 282 by tightening the
+     name-to-WGT gap below (cards were coming out taller than wanted). */
   flex:0 0 auto;
-  min-height:250px;
+  min-height:282px;
 }
-.ac-top{ display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
+.ac-top{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .ac-name{
   font-family:var(--font-heading); font-weight:700; font-size:15.2px; color:var(--navy); cursor:pointer;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:38px;
 }
 .ac-name:hover{ text-decoration:underline; }
-.ac-wgt-code{ font-family:var(--font-mono, monospace); font-size:11px; color:var(--text-muted); letter-spacing:.02em; margin-top:1px; }
-.ac-desc{ font-size:12.6px; color:var(--text-secondary); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:32px; }
+.ac-wgt-code{ font-family:var(--font-mono, monospace); font-size:11px; color:var(--text-muted); letter-spacing:.02em; margin-top:-5px; }
+.ac-desc{
+  font-size:11.8px; font-weight:700; color:var(--text-secondary); display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical;
+  overflow:hidden; min-height:64px;
+  /* Pushed as far as reasonably fits on the card: 4 lines at a touch
+     smaller than the original 12.6px/2-line version, so a real chunk of
+     "what this does" shows up without opening the card at all. */
+}
 .ac-meta-row{ display:flex; align-items:center; gap:8px; font-size:11.6px; color:var(--text-muted); flex-wrap:wrap; min-height:16px; }
 .ac-meta-row .dot-sep::before{ content:'•'; margin:0 2px; }
 .ac-tags{ display:flex; gap:5px; flex-wrap:wrap; align-content:flex-start; min-height:56px; }
